@@ -85,6 +85,47 @@ Equations need **substituted coefficients** (numbers, not `C(1)`) to be decompos
 - **Impact / attribute** hold the add-factors of every other equation at their A values and re-solve the equations period by period. Same-period loops are iterated to convergence. Variables whose equation can't be evaluated are held fixed and listed.
 - **Channel share** in `path` = product of the link shares. It is a rough guide to which channel matters; `impact` gives the exact number.
 
+## Which shocks matter most (Importance)
+
+`python scenario_compare.py importance --a … --b … --eq … --csv importance.csv` (also the *Importance* tab of the report).
+
+**Shocks** are the changed exogenous variables (no equation, or listed in `--exog`) and the changed add-factors. Each shock is switched from A to B on its own and everything it feeds is re-solved. For each variable y that moved, its share of y's gap is computed over the whole window:
+
+    share = Σ_t effect_t · gap_t / Σ_t gap_t²
+
+For each variable, the shares of all shocks add up to about 100% (exactly 100% when the model is linear). **Importance** is the average share across variables:
+- `--weight concept` (default): each concept counts once, so 50 state copies of one variable don't dominate
+- `--weight all`: every variable counts equally
+- `--weight key`: only the key variables from the Summary tab (or `--key …`)
+
+The output also gives how many variables a shock explains ≥10% / ≥50% of, and which variables it explains most. The CSV comes with `importance_matrix.csv`, listing every variable × shock share ≥1%. Speed: about 900 shocks on a 20,000-equation model take 35 seconds. Use `--no-importance` to skip it in the report.
+
+## Equations that cannot be used
+
+`python scenario_compare.py check --a … --b … --eq … -o not_evaluable.csv` writes one row per equation the tool cannot use, with the reason:
+- coefficients not substituted (`C(1)`)
+- specification only (`ls y c x`)
+- could not parse
+- unsupported function (the function is named)
+- input series missing from the data (the series is named)
+- equation gives missing values (e.g. log of a negative number)
+- missing values in some quarters (a warning; the equation is still used)
+
+`report` writes the same file automatically, next to the report, as `<report>_not_evaluable.csv`.
+
+Functions the tool understands: all EViews functions that can appear in a series or model equation (about 170, taken from the EViews Command Reference), including:
+- **math:** `LOG, EXP, ABS, SQRT, LOG10, @LOGX, @INV, @FACT, @EXPM1, @LOG1P, @SIGN, @LOGIT, @GAMMA, @MOD, @POW, @ROUND/@FLOOR/@CEILING(x[,n])`
+- **trigonometry:** `@SIN, @COS, …`
+- **distributions:** `@CNORM, @DNORM, @QNORM, @CLOGISTIC, @ERF, …`
+- **logic and NA handling:** `@RECODE, @IIF/@IFF, @NAN, @ISNA, @EQNA, @NEQNA, @BOUNDS, @BETWEEN, @INLIST`, comparisons and `AND/OR`
+- **time series:** `D, DLOG, @LAG, @PC/@PCH/@PCA/@PCHA/@PCY/@PCHY, @BRIDGE, @YTD, @DEMEAN, @DETREND`
+- **dates:** `@TREND, @TRENDC, @TRENDBR, @OBSNUM, @DURING, @ISPERIOD, @BEFORE, @AFTER, @SEAS, @YEAR, @QUARTER, @MONTH, @ELEM`
+- **all moving statistics:** `@MOV*` (NAs propagate) and `@M*` (NAs skipped): sum, average, centred average, stdev, var, cov, cor, max, min, median, …
+- **all cumulative statistics:** `@CUM*` and `@CUMB*`, with an optional sample
+- **sample statistics:** `@MEAN, @SUM, @STDEV, @MAX, @OBS, @QUANTILE, @FIRST, @LAST, …(x[,"sample"])`
+
+String, matrix and program functions are not included, because they can't appear in a model equation.
+
 ## Variables the team set exogenously
 
 If the team overrode a variable that has an equation (exogenized it), list it with `--exog`:
@@ -109,7 +150,7 @@ Without `--exog`, an exogenized variable shows up as *mostly add-factor*. The to
 | option | default | what |
 |---|---|---|
 | `--tol` | 1e-6 | relative tolerance before a series counts as different |
-| `--geo-sep` | `.` | character before the geography code (for the *By concept / By geography* tabs) |
+| `--geo-sep` | auto | character before the geography code: `.`, `_`, or auto-detect. A name ending counts as a geography only if 3+ concepts share it |
 | `--exog LIST` | | variables set exogenously by the team (file or comma list) |
 | `--af-suffix` | `_A` | suffix of add-factor series (`GDP.US_A`; also matches `GDP_A.US`); comma-separate several |
 | `--adj-threshold` | 0.25 | add-factor share that tags a variable "mostly add-factor" |

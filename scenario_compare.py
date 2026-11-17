@@ -524,12 +524,13 @@ class EvalError(Exception):
 
 
 _TOKRE = re.compile(r'''\s*(?:
-    (?P<num>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)
+    (?P<str>"[^"]*")
+  | (?P<num>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)
   | (?P<name>@?[A-Za-z_][A-Za-z0-9_$.%#]*)
   | (?P<op>\*\*|<=|>=|<>|[-+*/^(),=<>])
 )''', re.X)
 
-FUNCS = {'LOG', 'LN', 'EXP', 'ABS', 'SQR', 'SQRT', 'D', 'DLOG'}
+FUNCS = {'LOG', 'LN', 'EXP', 'ABS', 'SQR', 'SQRT', 'D', 'DLOG', 'LOG10', 'INV', 'LAG'}
 EXCLUDE = {'C', 'AR', 'MA', 'SAR', 'SMA', 'PDL', 'NA'}
 
 
@@ -541,8 +542,10 @@ def tokenize(s):
             continue
         m = _TOKRE.match(s, pos)
         if not m or m.end() == pos:
-            raise ParseError('unexpected character %r' % s[pos])
-        if m.group('num') is not None:
+            raise ParseError('unexpected character %r at "%s"' % (s[pos], s[max(0, pos - 15):pos + 10]))
+        if m.group('str') is not None:
+            toks.append(('str', m.group('str')[1:-1]))
+        elif m.group('num') is not None:
             toks.append(('num', m.group('num')))
         elif m.group('name') is not None:
             toks.append(('name', m.group('name')))
@@ -572,9 +575,30 @@ class _Parser:
             raise ParseError('expected %r' % v)
 
     def parse(self):
-        n = self.expr()
+        n = self.full()
         if self.i != len(self.t):
             raise ParseError('unexpected %r' % (self.peek()[1],))
+        return n
+
+    def full(self):   # a or b
+        n = self.andx()
+        while self.peek()[0] == 'name' and self.peek()[1].upper() == 'OR':
+            self.take()
+            n = ('bin', 'OR', n, self.andx())
+        return n
+
+    def andx(self):   # a and b
+        n = self.cmp()
+        while self.peek()[0] == 'name' and self.peek()[1].upper() == 'AND':
+            self.take()
+            n = ('bin', 'AND', n, self.cmp())
+        return n
+
+    def cmp(self):    # a < b, a = b, ...
+        n = self.expr()
+        while self.peek()[1] in ('<', '>', '<=', '>=', '=', '<>') and self.peek()[0] == 'op':
+            op = self.take()[1]
+            n = ('bin', op, n, self.expr())
         return n
 
     def expr(self):
@@ -622,8 +646,10 @@ class _Parser:
         kind, val = self.take()
         if kind == 'num':
             return ('num', float(val))
-        if val == '(':
-            n = self.expr()
+        if kind == 'str':
+            return ('str', val)
+        if kind == 'op' and val == '(':
+            n = self.full()
             self.expect(')')
             return n
         if kind == 'name':
@@ -637,10 +663,10 @@ class _Parser:
                 self.take()
                 args = []
                 if self.peek()[1] != ')':
-                    args.append(self.expr())
+                    args.append(self.full())
                     while self.peek()[1] == ',':
                         self.take()
-                        args.append(self.expr())
+                        args.append(self.full())
                 self.expect(')')
                 return ('call', up, args)
             if up.startswith('@'):
@@ -652,7 +678,12 @@ class _Parser:
 def parse_expr(toks):
     if not toks:
         raise ParseError('empty expression')
-    return _Parser(toks).parse()
+    p = _Parser(toks)
+    try:
+        return p.parse()
+    except ParseError as e:
+        near = ' '.join(v for _, v in toks[max(0, p.i - 4):p.i + 2])
+        raise ParseError('%s, near "%s"' % (e, near))
 
 
 def ast_vars(node, out=None):
@@ -721,12 +752,86 @@ def _diff(xs, k):
     return [xs[i] - xs[i - k] for i in range(k, len(xs))]
 
 
+# periods of the loaded data, set by Model, used by date functions (@DURING, @ELEM, @SEAS, ...)
+PERIODS = {'keys': [], 'index': {}}
+
+
+def set_periods(keys):
+    PERIODS['keys'] = list(keys)
+    PERIODS['index'] = {k: i for i, k in enumerate(keys)}
+
+
+def _period_idx(text, end=False):
+    """'2020q1' -> index of that period; a year like '2020' -> its first (or last) period."""
+    t = text.strip()
+    p = parse_period(t)
+    if p is None:
+        raise EvalError('cannot read date %r' % text)
+    key, idx, keys = p[0], PERIODS['index'], PERIODS['keys']
+    if key in idx:
+        return idx[key]
+    # coarser date (a year) or a date outside the data: nearest period
+    cands = [i for i, k in enumerate(keys) if k[0] == key[0]] if key[1] == 1 else []
+    if cands:
+        return cands[-1] if end else cands[0]
+    if keys and key < keys[0]:
+        return 0 if not end else -1
+    return len(keys) if not end else len(keys) - 1
+
+
+def _sample_mask(text, lo, hi):
+    """EViews sample string '2020q1 2020q4 2022q1 2022q2' (pairs; '@first'/'@last' allowed)."""
+    toks = text.replace(',', ' ').split()
+    n = len(PERIODS['keys'])
+    if len(toks) == 1:
+        toks = toks * 2
+    if len(toks) % 2:
+        raise EvalError('odd number of dates in sample %r' % text)
+    out = [0.0] * (hi - lo + 1)
+    for a, b in zip(toks[::2], toks[1::2]):
+        ia = 0 if a.lower() == '@first' else _period_idx(a)
+        ib = n - 1 if b.lower() == '@last' else _period_idx(b, end=True)
+        for t in range(max(lo, ia), min(hi, ib) + 1):
+            out[t - lo] = 1.0
+    return out
+
+
+def _sarg(node, fn):
+    if node[0] != 'str':
+        raise EvalError('%s needs a date string argument' % fn)
+    return node[1]
+
+
+def _period_field(t, field):
+    keys = PERIODS['keys']
+    if not 0 <= t < len(keys):
+        return NAN
+    y, kind, sub = keys[t]
+    if field == 'YEAR':
+        return float(y)
+    if kind == 2:
+        q, m = sub, sub * 3
+    elif kind == 3 or kind == 4:
+        m = sub
+        q = (m - 1) // 3 + 1
+    elif kind == 5:
+        m = sub // 100
+        q = (m - 1) // 3 + 1
+    else:
+        q = m = NAN
+    return float(q if field == 'QUARTER' else m)
+
+
 def evaluate(node, get, lo, hi, ppy):
     """Evaluate an expression for period indices lo..hi; returns list of floats (NaN = missing)."""
     k = node[0]
+    if k == 'str':
+        raise EvalError('text %r used as a number' % node[1])
     if k == 'num':
         return [node[1]] * (hi - lo + 1)
     if k == 'var':
+        if node[1] == 'NA':
+            return [NAN] * (hi - lo + 1)
         s = get(node[1])
         a, b = lo + node[2], hi + node[2]
         n = len(s)
@@ -749,6 +854,11 @@ def evaluate(node, get, lo, hi, ppy):
             return [p / q if q != 0 else NAN for p, q in zip(x, y)]
         if op == '^':
             return [_pow(p, q) for p, q in zip(x, y)]
+        if op in ('<', '>', '<=', '>=', '=', '<>', 'AND', 'OR'):
+            f = {'<': lambda a, b: a < b, '>': lambda a, b: a > b, '<=': lambda a, b: a <= b,
+                 '>=': lambda a, b: a >= b, '=': lambda a, b: a == b, '<>': lambda a, b: a != b,
+                 'AND': lambda a, b: bool(a) and bool(b), 'OR': lambda a, b: bool(a) or bool(b)}[op]
+            return [NAN if (p != p or q != q) else (1.0 if f(p, q) else 0.0) for p, q in zip(x, y)]
         raise EvalError('operator %s' % op)
     if k == 'coef':
         raise EvalError('equation has unsubstituted coefficient C(%d)' % node[1])
@@ -789,9 +899,399 @@ def evaluate(node, get, lo, hi, ppy):
             out = [sum(xs[i - n + 1:i + 1]) for i in range(n - 1, len(xs))]
             return [v / n for v in out] if f == 'MOVAV' else out
         if f == 'TREND':
-            return [float(t) for t in range(lo, hi + 1)]
+            base = _period_idx(_sarg(args[0], '@TREND')) if args else 0
+            return [float(t - base) for t in range(lo, hi + 1)]
+        if f in ('DURING', 'ISPERIOD'):
+            return _sample_mask(_sarg(args[0], '@' + f), lo, hi)
+        if f in ('BEFORE', 'AFTER'):
+            i0 = _period_idx(_sarg(args[0], '@' + f))
+            return [1.0 if (t < i0 if f == 'BEFORE' else t >= i0) else 0.0 for t in range(lo, hi + 1)]
+        if f == 'SEAS':
+            q = _const(args[0])
+            fld = 'MONTH' if ppy == 12 else 'QUARTER'
+            return [1.0 if _period_field(t, fld) == q else 0.0 for t in range(lo, hi + 1)]
+        if f in ('YEAR', 'QUARTER', 'MONTH'):
+            return [_period_field(t, f) for t in range(lo, hi + 1)]
+        if f == 'ELEM':
+            i0 = _period_idx(_sarg(args[1], '@ELEM'))
+            v = evaluate(args[0], get, i0, i0, ppy)[0]
+            return [v] * (hi - lo + 1)
+        if f in ('RECODE', 'IIF'):
+            c = evaluate(args[0], get, lo, hi, ppy)
+            a = evaluate(args[1], get, lo, hi, ppy)
+            b = evaluate(args[2], get, lo, hi, ppy)
+            return [NAN if cc != cc else (aa if cc else bb) for cc, aa, bb in zip(c, a, b)]
+        if f in ('NAN', 'NA2'):   # @nan(x, y): x, with missing values replaced by y
+            a = evaluate(args[0], get, lo, hi, ppy)
+            b = evaluate(args[1], get, lo, hi, ppy)
+            return [bb if aa != aa else aa for aa, bb in zip(a, b)]
+        if f == 'ISNA':
+            return [1.0 if v != v else 0.0 for v in evaluate(args[0], get, lo, hi, ppy)]
+        if f in ('MAX', 'MIN') and len(args) == 2 and args[1][0] != 'str':
+            a = evaluate(args[0], get, lo, hi, ppy)
+            b = evaluate(args[1], get, lo, hi, ppy)
+            g = max if f == 'MAX' else min
+            return [NAN if (x != x or y != y) else g(x, y) for x, y in zip(a, b)]
+        if f in ('ROUND', 'FLOOR', 'CEILING', 'CEIL', 'INT') and len(args) == 1:
+            g = {'ROUND': _round_half_away, 'FLOOR': math.floor, 'CEILING': math.ceil, 'CEIL': math.ceil, 'INT': int}[f]
+            return [float(g(v)) if v == v else NAN for v in evaluate(args[0], get, lo, hi, ppy)]
+        if f in ('LOG10',):
+            return [math.log10(v) if v > 0 else NAN for v in evaluate(args[0], get, lo, hi, ppy)]
+        if f in ('INV',):
+            return [1.0 / v if v else NAN for v in evaluate(args[0], get, lo, hi, ppy)]
+        if f in ('LAG',):
+            n = int(_const(args[1])) if len(args) > 1 else 1
+            return evaluate(args[0], get, lo - n, hi - n, ppy)
+        r = _eviews_extra(f, args, get, lo, hi, ppy)
+        if r is not None:
+            return r
         raise EvalError('unsupported function %s' % node[1])
     raise EvalError('bad node')
+
+
+# ---------------------------------------------------------------------------
+# The rest of the EViews series functions (Command Reference, "Operator and Function Reference")
+# ---------------------------------------------------------------------------
+def _round_half_away(v):
+    return math.copysign(math.floor(abs(v) + 0.5), v)
+
+
+def _nz(xs):
+    return [v for v in xs if v == v]
+
+
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else NAN
+
+
+def _var(xs, ddof):
+    n = len(xs)
+    if n - ddof <= 0:
+        return NAN
+    m = sum(xs) / n
+    return sum((v - m) ** 2 for v in xs) / (n - ddof)
+
+
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return NAN
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def _quantile(xs, q):   # Cleveland definition (as EViews)
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return NAN
+    pos = q * n - 0.5
+    if pos <= 0:
+        return xs[0]
+    if pos >= n - 1:
+        return xs[-1]
+    i = int(math.floor(pos))
+    return xs[i] + (pos - i) * (xs[i + 1] - xs[i])
+
+
+def _skew(xs):
+    n = len(xs)
+    if n < 2:
+        return NAN
+    m = sum(xs) / n
+    sd = math.sqrt(sum((v - m) ** 2 for v in xs) / n)
+    return sum(((v - m) / sd) ** 3 for v in xs) / n if sd else NAN
+
+
+def _kurt(xs):
+    n = len(xs)
+    if n < 2:
+        return NAN
+    m = sum(xs) / n
+    sd = math.sqrt(sum((v - m) ** 2 for v in xs) / n)
+    return sum(((v - m) / sd) ** 4 for v in xs) / n if sd else NAN
+
+
+def _cov(xs, ys, ddof):
+    pr = [(a, b) for a, b in zip(xs, ys) if a == a and b == b]
+    n = len(pr)
+    if n - ddof <= 0:
+        return NAN
+    ma, mb = sum(a for a, _ in pr) / n, sum(b for _, b in pr) / n
+    return sum((a - ma) * (b - mb) for a, b in pr) / (n - ddof)
+
+
+def _cor(xs, ys):
+    c = _cov(xs, ys, 0)
+    pr = [(a, b) for a, b in zip(xs, ys) if a == a and b == b]
+    va, vb = _var([a for a, _ in pr], 0), _var([b for _, b in pr], 0)
+    return c / math.sqrt(va * vb) if va and vb and va == va and vb == vb else NAN
+
+
+_STAT1 = {   # name -> function of the non-missing values
+    'SUM': lambda x: sum(x), 'AV': _mean, 'MEAN': _mean, 'MEDIAN': _median,
+    'STDEV': lambda x: math.sqrt(_var(x, 1)) if len(x) > 1 else NAN, 'STDEVS': lambda x: math.sqrt(_var(x, 1)) if len(x) > 1 else NAN,
+    'STDEVP': lambda x: math.sqrt(_var(x, 0)) if x else NAN,
+    'VAR': lambda x: _var(x, 0), 'VARP': lambda x: _var(x, 0), 'VARS': lambda x: _var(x, 1),
+    'MAX': lambda x: max(x) if x else NAN, 'MIN': lambda x: min(x) if x else NAN,
+    'SUMSQ': lambda x: sum(v * v for v in x), 'SKEW': _skew, 'KURT': _kurt,
+    'PROD': lambda x: math.prod(x) if x else NAN,
+}
+_STAT2 = {'COV': lambda x, y: _cov(x, y, 0), 'COVP': lambda x, y: _cov(x, y, 0), 'COVS': lambda x, y: _cov(x, y, 1),
+          'COR': _cor, 'INNER': lambda x, y: sum(a * b for a, b in zip(x, y) if a == a and b == b)}
+
+
+def _sample_vals(args, k, get, ppy):
+    """Whole-workfile values of args[0] (and args[1] for two-series stats), restricted to an optional sample."""
+    T = len(PERIODS['keys'])
+    xs = [evaluate(a, get, 0, T - 1, ppy) for a in args[:k]]
+    if len(args) > k:
+        m = _sample_mask(_sarg(args[k], 'sample'), 0, T - 1)
+        xs = [[v if mm else NAN for v, mm in zip(x, m)] for x in xs]
+    return xs
+
+
+def _normcdf(x):
+    return 0.5 * math.erfc(-x / math.sqrt(2))
+
+
+def _normq(p):
+    if not 0 < p < 1:
+        return NAN if not (p == 0 or p == 1) else (-float('inf') if p == 0 else float('inf'))
+    lo, hi = -40.0, 40.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if _normcdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def _elem1(f):
+    """Element-by-element functions of one argument."""
+    E = {
+        'FACT': lambda v: float(math.factorial(int(v))) if v >= 0 and v == int(v) and v < 171 else NAN,
+        'FACTLOG': lambda v: math.lgamma(v + 1) if v >= 0 else NAN,
+        'EXPM1': math.expm1, 'LOG1P': lambda v: math.log1p(v) if v > -1 else NAN,
+        'LOG1MEXP': lambda v: math.log(-math.expm1(v)) if v < 0 else NAN,
+        'SIGN': lambda v: float((v > 0) - (v < 0)),
+        'LOGIT': lambda v: 1 / (1 + math.exp(-v)) if v > -700 else 0.0,
+        'GAMMA': lambda v: math.gamma(v) if v > 0 or v != int(v) else NAN,
+        'GAMMALOG': lambda v: math.lgamma(v) if v > 0 else NAN,
+        'SIN': math.sin, 'COS': math.cos, 'TAN': math.tan,
+        'ASIN': lambda v: math.asin(v) if -1 <= v <= 1 else NAN, 'ACOS': lambda v: math.acos(v) if -1 <= v <= 1 else NAN,
+        'ATAN': math.atan,
+        'CNORM': _normcdf, 'DNORM': lambda v: math.exp(-v * v / 2) / math.sqrt(2 * math.pi), 'QNORM': _normq,
+        'CLOGISTIC': lambda v: 1 / (1 + math.exp(-v)) if v > -700 else 0.0,
+        'DLOGISTIC': lambda v: math.exp(-v) / (1 + math.exp(-v)) ** 2 if abs(v) < 700 else 0.0,
+        'QLOGISTIC': lambda v: math.log(v / (1 - v)) if 0 < v < 1 else NAN,
+        'ERF': math.erf, 'ERFC': math.erfc,
+        'ISNA': None,
+    }
+    return E.get(f)
+
+
+def _eviews_extra(f, args, get, lo, hi, ppy):
+    n_out = hi - lo + 1
+    T = len(PERIODS['keys'])
+
+    def ev(a, l=lo, h=hi):
+        return evaluate(a, get, l, h, ppy)
+
+    def safe(g, xs):
+        out = []
+        for v in xs:
+            try:
+                out.append(g(v) if v == v else NAN)
+            except (ValueError, OverflowError, ZeroDivisionError):
+                out.append(NAN)
+        return out
+
+    # numeric constants
+    if f in ('PI',) and not args:
+        return [math.pi] * n_out
+    if f in ('E',) and not args:
+        return [math.e] * n_out
+    if f in ('NA',) and not args:
+        return [NAN] * n_out
+    if f == 'OBSNUM':
+        return [float(t + 1) for t in range(lo, hi + 1)]
+    if f == 'TRENDC':
+        return [float(t) for t in range(lo, hi + 1)]
+    if f == 'TRENDBR':
+        b = _period_idx(_sarg(args[0], '@TRENDBR'))
+        return [float(max(0, t - b)) for t in range(lo, hi + 1)]
+    # one-argument element functions
+    g = _elem1(f)
+    if g is not None and len(args) == 1:
+        return safe(g, ev(args[0]))
+    # two-argument element functions
+    if f in ('MOD', 'POW', 'POWM1', 'POW1PM1', 'LOGX', 'ATAN2', 'EQNA', 'NEQNA'):
+        a, b = ev(args[0]), ev(args[1])
+        out = []
+        for x, y in zip(a, b):
+            if f == 'EQNA':
+                out.append(1.0 if (x == y or (x != x and y != y)) else 0.0)
+                continue
+            if f == 'NEQNA':
+                out.append(0.0 if (x == y or (x != x and y != y)) else 1.0)
+                continue
+            if x != x or y != y:
+                out.append(NAN)
+                continue
+            try:
+                out.append({'MOD': lambda: math.fmod(x, y), 'POW': lambda: _pow(x, y), 'POWM1': lambda: _pow(x, y) - 1,
+                            'POW1PM1': lambda: _pow(1 + x, y) - 1, 'LOGX': lambda: math.log(x) / math.log(y),
+                            'ATAN2': lambda: math.atan2(x, y)}[f]())
+            except (ValueError, ZeroDivisionError, OverflowError):
+                out.append(NAN)
+        return out
+    if f in ('ROUND', 'FLOOR', 'CEILING', 'CEIL') and len(args) == 2:
+        x, n = ev(args[0]), _const(args[1])
+        if f == 'ROUND':     # documented: n=2 rounds to the nearest 100, n=-2 to the nearest 0.01
+            sc = 10.0 ** n
+            return [_round_half_away(v / sc) * sc if v == v else NAN for v in x]
+        sc = 10.0 ** n       # documented: @floor(@pi,2) = 3.14
+        g2 = math.floor if f == 'FLOOR' else math.ceil
+        return [g2(v * sc) / sc if v == v else NAN for v in x]
+    if f == 'BOUNDS':
+        x, a, b = ev(args[0]), ev(args[1]), ev(args[2])
+        return [NAN if NAN in (v,) or v != v else min(max(v, aa), bb) for v, aa, bb in zip(x, a, b)]
+    if f == 'BETWEEN':
+        x, a, b = ev(args[0]), ev(args[1]), ev(args[2])
+        return [NAN if v != v else (1.0 if aa <= v <= bb else 0.0) for v, aa, bb in zip(x, a, b)]
+    if f == 'INLIST':
+        vals = {float(t) for t in _sarg(args[1], '@INLIST').replace(',', ' ').split()}
+        return [NAN if v != v else (1.0 if v in vals else 0.0) for v in ev(args[0])]
+    if f == 'IFF':
+        c, a, b = ev(args[0]), ev(args[1]), ev(args[2])
+        return [NAN if cc != cc else (aa if cc else bb) for cc, aa, bb in zip(c, a, b)]
+    if f == 'BRIDGE':   # fill NAs with the last non-missing value
+        xs = ev(args[0], 0, hi)
+        last = NAN
+        out = []
+        for v in xs:
+            if v == v:
+                last = v
+            out.append(last)
+        return out[lo:] if lo >= 0 else [NAN] * (-lo) + out
+    if f == 'YTD':      # cumulative sum within the calendar year
+        xs = ev(args[0], 0, hi)
+        out, acc, yr = [], 0.0, None
+        for t, v in enumerate(xs):
+            y = PERIODS['keys'][t][0] if t < T else None
+            if y != yr:
+                acc, yr = 0.0, y
+            acc += v if v == v else 0.0
+            out.append(acc)
+        return out[lo:] if lo >= 0 else [NAN] * (-lo) + out
+    if f in ('DEMEAN', 'DETREND'):
+        x = _sample_vals(args, 1, get, ppy)[0]
+        full = ev(args[0], 0, T - 1)
+        ts = [t for t, v in enumerate(x) if v == v]
+        if f == 'DEMEAN':
+            m = _mean(_nz(x))
+            res = [v - m for v in full]
+        else:
+            if len(ts) < 2:
+                return [NAN] * n_out
+            mt, mv = _mean(ts), _mean([x[t] for t in ts])
+            b = sum((t - mt) * (x[t] - mv) for t in ts) / sum((t - mt) ** 2 for t in ts)
+            res = [v - (mv + b * (t - mt)) for t, v in enumerate(full)]
+        return [res[t] if 0 <= t < T else NAN for t in range(lo, hi + 1)]
+    # descriptive statistics over the workfile or a sample -> the same value in every period
+    if f in _STAT1 and (len(args) == 1 or (len(args) == 2 and args[1][0] == 'str')):
+        v = _STAT1[f](_nz(_sample_vals(args, 1, get, ppy)[0]))
+        return [v] * n_out
+    if f in ('OBS', 'NAS'):
+        x = _sample_vals(args, 1, get, ppy)[0]
+        m = _sample_mask(_sarg(args[1], 'sample'), 0, T - 1) if len(args) > 1 else [1] * T
+        c = sum(1 for v, mm in zip(x, m) if mm and (v == v) == (f == 'OBS'))
+        return [float(c)] * n_out
+    if f in _STAT2 and (len(args) == 2 or (len(args) == 3 and args[2][0] == 'str')):
+        x, y = _sample_vals(args, 2, get, ppy)
+        return [_STAT2[f](x, y)] * n_out
+    if f in ('QUANTILE',):
+        x = _sample_vals([args[0]] + list(args[2:]), 1, get, ppy)[0]
+        return [_quantile(_nz(x), _const(args[1]))] * n_out
+    if f in ('FIRST', 'LAST'):
+        x = _nz(_sample_vals(args, 1, get, ppy)[0])
+        return [(x[0] if f == 'FIRST' else x[-1]) if x else NAN] * n_out
+    # moving (rolling) statistics: @mov* propagate NAs, @m* skip them
+    m = re.match(r'^(MOV|M)(SUM|AV|AVC|STDEV|STDEVS|STDEVP|VAR|VARS|VARP|MAX|MIN|MEDIAN|SUMSQ|SKEW|KURT|OBS|NAS|COV|COVS|COVP|COR|INNER)$', f)
+    if m and f not in ('MAX', 'MIN', 'MEDIAN'):
+        prop, st = m.group(1) == 'MOV', m.group(2)
+        if st in _STAT2:
+            n = int(_const(args[2]))
+            xs = [ev(args[0], lo - n + 1, hi), ev(args[1], lo - n + 1, hi)]
+            out = []
+            for i in range(n - 1, len(xs[0])):
+                a, b = xs[0][i - n + 1:i + 1], xs[1][i - n + 1:i + 1]
+                out.append(NAN if prop and any(v != v for v in a + b) else _STAT2[st](a, b))
+            return out
+        n = int(_const(args[1]))
+        if st == 'AVC':     # centred; even n: window n+1 with half weight at both ends
+            if n % 2:
+                h = n // 2
+                w = [1.0] * n
+            else:
+                h = n // 2
+                w = [0.5] + [1.0] * (n - 1) + [0.5]
+            xs = ev(args[0], lo - h, hi + h)
+            out = []
+            for i in range(n_out):
+                win = xs[i:i + len(w)]
+                if prop and any(v != v for v in win):
+                    out.append(NAN)
+                    continue
+                pr = [(v, ww) for v, ww in zip(win, w) if v == v]
+                out.append(sum(v * ww for v, ww in pr) / sum(ww for _, ww in pr) if pr else NAN)
+            return out
+        xs = ev(args[0], lo - n + 1, hi)
+        out = []
+        for i in range(n - 1, len(xs)):
+            win = xs[i - n + 1:i + 1]
+            if st == 'NAS':
+                out.append(float(sum(1 for v in win if v != v)))
+                continue
+            if st == 'OBS':
+                out.append(float(sum(1 for v in win if v == v)))
+                continue
+            if prop and any(v != v for v in win):
+                out.append(NAN)
+                continue
+            nz = _nz(win)
+            out.append(_STAT1['MEAN' if st == 'AV' else st](nz) if nz else NAN)
+        return out
+    # cumulative statistics (NAs skipped), forward @cum* or backward @cumb*, optional sample
+    m = re.match(r'^CUM(B?)(SUM|PROD|MEAN|STDEV|STDEVS|STDEVP|VAR|VARS|VARP|MAX|MIN|SUMSQ|OBS|NAS|MEDIAN|QUANTILE)$', f)
+    if m:
+        back, st = m.group(1) == 'B', m.group(2)
+        q = _const(args[1]) if st == 'QUANTILE' else None
+        rest = args[2:] if st == 'QUANTILE' else args[1:]
+        full = ev(args[0], 0, T - 1)
+        mask = _sample_mask(_sarg(rest[0], 'sample'), 0, T - 1) if rest else [1.0] * T
+        idx = [t for t in range(T) if mask[t]]
+        res = [NAN] * T
+        seq = idx[::-1] if back else idx
+        acc = []
+        for t in seq:
+            v = full[t]
+            if st == 'NAS':
+                acc.append(v)
+                res[t] = float(sum(1 for z in acc if z != z))
+                continue
+            if v == v:
+                acc.append(v)
+            if st == 'OBS':
+                res[t] = float(len(acc))
+            elif st == 'QUANTILE':
+                res[t] = _quantile(acc, q)
+            elif acc:
+                res[t] = _STAT1['MEAN' if st == 'MEAN' else st](acc)
+        return [res[t] if 0 <= t < T else NAN for t in range(lo, hi + 1)]
+    return None
 
 
 def ast_text(node):
@@ -809,6 +1309,8 @@ def ast_text(node):
         return '%s%s%s' % (ast_text(node[2]), node[1], ast_text(node[3]))
     if k == 'call':
         return '%s(%s)' % (node[1], ','.join(ast_text(a) for a in node[2]))
+    if k == 'str':
+        return '"%s"' % node[1]
     return '?'
 
 
@@ -869,11 +1371,26 @@ _SPEC = re.compile(r'^(?:equation\s+)?(?:[A-Za-z_][\w$]*\.)?(ls|tsls|gmm|nls|arc
                    r'glm|ardl|qreg|robustls|cointreg)\b(?:\([^)]*\))?\s*', re.I)
 
 
+def _strip_comment(s):
+    """Drop a trailing EViews comment (' ...) that is not inside a quoted string."""
+    inq = False
+    for i, ch in enumerate(s):
+        if ch == '"':
+            inq = not inq
+        elif ch == "'" and not inq:
+            return s[:i].rstrip()
+    return s
+
+
 def parse_equation_line(raw, source):
     """Parse one logical line of EViews text. Returns Equation, ('addlink', y, af) or None."""
     s = raw.strip()
     if not s or s[0] in "'#;!%{" or s.startswith('//'):
         return None
+    # characters pasted from Word / Excel
+    s = (s.replace('\u2212', '-').replace('\u2013', '-').replace('\u2014', '-').replace('\u00a0', ' ')
+          .replace('\u201c', '"').replace('\u201d', '"').replace('\t', ' '))
+    s = _strip_comment(s)
     s = re.sub(r'\[[^\]]*\]', '', s).strip()
     if not s or s.startswith(':'):
         return None
@@ -898,13 +1415,17 @@ def parse_equation_line(raw, source):
     if s.startswith('@'):
         return None
     text = s.strip()
+    why = ''
     try:
         toks = tokenize(s)
-    except ParseError:
+    except ParseError as e:
         toks = None
+        why = str(e)
     if toks is not None:
         depth, eqi = 0, -1
-        for i, (_, v) in enumerate(toks):
+        for i, (kd, v) in enumerate(toks):
+            if kd != 'op':
+                continue
             if v == '(':
                 depth += 1
             elif v == ')':
@@ -919,6 +1440,9 @@ def parse_equation_line(raw, source):
             except ParseError as e:
                 lhs = rhs = None
                 why = str(e)
+                if eqi + 1 >= len(toks):
+                    why = 'nothing after "="'
+
             if lhs is not None:
                 lv, rv = ast_vars(lhs), ast_vars(rhs)
                 if not lv:
@@ -955,7 +1479,7 @@ def parse_equation_line(raw, source):
     if not lv:
         return None
     return Equation(lv[0], rv + [v for v in lv[1:] if v not in rv], text, kind, source,
-                    why='could not parse expression; dependencies only')
+                    why='could not parse: %s' % (why or 'unknown problem'))
 
 
 def _logical_lines(text):
@@ -1081,7 +1605,7 @@ def parse_shock(s):
 
 class Model:
     def __init__(self, A, B, eqs=None, addlinks=None, start=None, end=None, tol=1e-6,
-                 geo_sep='.', adj_threshold=0.25, meta=None, verbose=True, af_suffix='_A', exog=None):
+                 geo_sep='auto', adj_threshold=0.25, meta=None, verbose=True, af_suffix='_A', exog=None):
         t0 = time.time()
         self.A, self.B = A, B
         self.tol = tol
@@ -1094,6 +1618,7 @@ class Model:
         self.ppy = infer_ppy(keys)
         T = self.T = len(keys)
         kidx = {k: i for i, k in enumerate(keys)}
+        set_periods(keys)
         self.a = self._align(A, kidx, T)
         self.b = self._align(B, kidx, T)
         self.desc = dict(B.desc)
@@ -1101,6 +1626,7 @@ class Model:
         if meta:
             self.desc.update(meta)
         self.eqs = dict(eqs or {})
+        self._detect_geo(geo_sep, af_suffix)
         # variables the team set exogenously: keep their equation for display, but treat them as
         # assumptions (no equation): never re-solved, so shocks stop there
         self.exog = {}
@@ -1263,16 +1789,42 @@ class Model:
                 return n[:-len(suf)]
         return n
 
+    def _detect_geo(self, sep, af_suffix):
+        """Find the geography separator and the geography codes.
+        A name's last token (after the separator) counts as a geography code only if the same token
+        ends the names of at least 3 different concepts, e.g. FGDP_ICAN, FLBR_ICAN, FHPI_ICAN.
+        So A_B_ICAN -> concept A_B, geography ICAN; but FRATE_10Y -> no geography."""
+        names = set(self.a) | set(self.b) | set(self.eqs)
+        afs = {x.strip().upper().lstrip('_.') for x in (af_suffix or '').split(',') if x.strip()}
+        best = None
+        for sp in (['.', '_'] if sep in (None, '', 'auto') else [sep]):
+            stems = defaultdict(set)
+            for n in names:
+                if sp in n:
+                    st, g = n.rsplit(sp, 1)
+                    if g and st and g not in afs:
+                        stems[g].add(st)
+            codes = {g for g, ss in stems.items() if len(ss) >= 3}
+            cover = sum(1 for n in names if sp in n and n.rsplit(sp, 1)[1] in codes)
+            if best is None or cover > best[2]:
+                best = (sp, codes, cover)
+        self.geo_sep, self.geo_codes, self.geo_cover = best if best and best[2] else (
+            (sep if sep not in (None, '', 'auto') else '.'), set(), 0)
+
     def geo(self, n):
         n = self._base_name(n)
         if self.geo_sep and self.geo_sep in n:
-            return n.rsplit(self.geo_sep, 1)[1]
+            g = n.rsplit(self.geo_sep, 1)[1]
+            if g in self.geo_codes:
+                return g
         return ''
 
     def stem(self, n):
         n = self._base_name(n)
         if self.geo_sep and self.geo_sep in n:
-            return n.rsplit(self.geo_sep, 1)[0]
+            st, g = n.rsplit(self.geo_sep, 1)
+            if g in self.geo_codes:
+                return st
         return n
 
     def series(self, n, which):
@@ -1500,7 +2052,9 @@ class Model:
             d = self._dyn(eq, periods)
         except EvalError as e:
             d = {'error': str(e)}
-        except (IndexError, ValueError, ZeroDivisionError, OverflowError, TypeError) as e:
+        except IndexError:
+            d = {'error': 'a function has too few arguments, e.g. @movav needs (series, n)'}
+        except (ValueError, ZeroDivisionError, OverflowError, TypeError) as e:
             d = {'error': 'evaluation failed: %s' % e}
         self._dd[n] = d
         return d
@@ -1557,6 +2111,10 @@ class Model:
                    af_name=self.af.get(n), af_changed=af is not None, fit_err=fit,
                    pgap=gap, pf=[sum(c[i] for c in contrib.values() if c[i] == c[i]) for i in range(len(gap))],
                    paf=af)
+        big = max([abs(g) for g in gap if g == g] + [0.0])
+        lim = max(1e-3 * big, 1e-12)
+        out['pshare'] = {d: [int(round(1000 * c[i] / g)) if (g == g and c[i] == c[i] and abs(g) > lim) else None
+                             for i, g in enumerate(gap)] for d, c in contrib.items()}
         if periods:
             out.update(contrib=contrib, af=af, inter=inter, gap=gap)
         return out
@@ -1958,6 +2516,13 @@ def cmd_info(M, args, eqstats=None, fails=None):
     print('Periods: %s .. %s (%d), %d per year' % (M.labels[0], M.labels[-1], M.T, M.ppy))
     print('Series: %d in both, %d only in A, %d only in B' % (len(M.common), len(M.only_a), len(M.only_b)))
     print('Comparison window: %s .. %s' % (M.labels[M.ws], M.labels[M.we]))
+    if M.geo_codes:
+        cnt = Counter(M.geo(n) for n in M.common if M.geo(n))
+        print('Geography: separator "%s", %d codes (%s%s); %d series have no geography'
+              % (M.geo_sep, len(M.geo_codes), ', '.join(g for g, _ in cnt.most_common(8)),
+                 ', ...' if len(M.geo_codes) > 8 else '', sum(1 for n in M.common if not M.geo(n))))
+    else:
+        print('Geography: no geography codes found (no name ending that is shared by 3+ concepts)')
     print('Series that differ: %d' % len(M.differs))
     if eqstats:
         print('Equations: %s' % ', '.join('%s=%d' % kv for kv in sorted(eqstats.items())))
@@ -2274,6 +2839,113 @@ def cmd_impact(M, args):
         print('%-24s %12s %9s %8s' % (n, fmt(v), fpct(p), fsh(s) if s is not None else ''))
 
 
+def check_equations(M):
+    """One row per equation that cannot be used (or only partly), with the reason."""
+    rows = []
+    allnames = set(M.a) | set(M.b)
+    for n in sorted(M.eqs):
+        eq = M.eqs[n]
+        differs = 'yes' if n in M.differs else ('no' if n in allnames else 'not in data')
+        cat = detail = ''
+        if n not in allnames:
+            cat, detail = 'variable not in the data', 'the equation defines %s, but no series by that name was loaded' % n
+        elif not eq.evaluable:
+            w = eq.why or ''
+            if 'specification' in w:
+                cat, detail = 'specification only', 'estimation spec (e.g. "ls y c x") with no coefficients'
+            elif 'coefficient' in w:
+                cat, detail = 'coefficients not substituted', 'contains C(i); export the equation with substituted coefficients'
+            else:
+                cat, detail = 'could not parse', w.replace('could not parse: ', '')
+        else:
+            d = M.dyn(n)
+            err = d.get('error') if d else 'no result'
+            if err:
+                m = re.search(r'unsupported function (\S+)', err)
+                m2 = re.search(r'series (\S+) is not in the data', err)
+                if m:
+                    cat, detail = 'unsupported function', m.group(1)
+                elif m2:
+                    cat, detail = 'input series missing from the data', m2.group(1)
+                elif 'missing values' in err:
+                    cat, detail = 'equation gives missing values', err
+                else:
+                    cat, detail = 'evaluation error', err
+            else:
+                # partly missing: the equation gives NA in quarters where the data has a value
+                try:
+                    ra = M.resid(n, 'a')
+                    a = M.series(n, 'a')
+                    bad = [M.labels[M.ws + i] for i, v in enumerate(ra)
+                           if v != v and a[M.ws + i] == a[M.ws + i]]
+                except EvalError:
+                    bad = []
+                if bad:
+                    cat = 'missing values in some quarters (warning; still used)'
+                    detail = '%d quarter(s): %s%s' % (len(bad), ', '.join(bad[:4]), ' ...' if len(bad) > 4 else '')
+        if cat:
+            rows.append([n, M.desc.get(n, ''), differs, cat, detail, eq.source, eq.text[:500]])
+    return rows
+
+
+def write_check(M, path, quiet=False):
+    rows = check_equations(M)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['variable', 'description', 'differs_between_scenarios', 'reason', 'detail', 'file', 'equation'])
+        w.writerows(rows)
+    if not quiet:
+        cnt = Counter(r[3] for r in rows)
+        print('%d of %d equations cannot be used fully; list written to %s' % (len(rows), len(M.eqs), path),
+              file=sys.stderr)
+        for k, v in cnt.most_common():
+            print('   %6d  %s' % (v, k), file=sys.stderr)
+        fn = Counter(r[4] for r in rows if r[3] == 'unsupported function')
+        if fn:
+            print('   unsupported functions: ' + ', '.join('%s (%d)' % kv for kv in fn.most_common(12)), file=sys.stderr)
+        miss = Counter(r[4] for r in rows if r[3] == 'input series missing from the data')
+        if miss:
+            print('   missing inputs, most used: ' + ', '.join('%s (%d)' % kv for kv in miss.most_common(8)), file=sys.stderr)
+    return rows
+
+
+def cmd_importance(M, args):
+    keys = pick_key_vars(M, getattr(args, 'key_list', None), 8)
+    res, share, targets = compute_importance(M, args.max_shocks, keys, log=lambda m: print(m, file=sys.stderr))
+    col = {'all': 'w_all', 'concept': 'w_concept', 'key': 'w_key'}[args.weight]
+    rows = sorted(res.values(), key=lambda r: -abs(r[col] or 0))
+    print('Importance of each scenario shock = average share of the gaps it explains (whole window, %s weights).'
+          % args.weight)
+    print('%d variables with an equation moved; %d shocks.\n' % (len(targets), len(rows)))
+    print('%-28s %-12s %8s %8s %8s %7s %7s  %s' % ('shock', 'type', 'all vars', 'concept', 'key vars', '>=10%', '>=50%', 'explains most of'))
+    for r in rows[:args.n]:
+        lab = ('add-factor ' + r['series']) if r['kind'] == 'addfactor' else r['series']
+        top = ', '.join('%s %.0f%%' % (y, 100 * v) for y, v in r['top'][:3])
+        print('%-28s %-12s %7.1f%% %7.1f%% %8s %7d %7d  %s' % (lab[:28], r['type'], 100 * r['w_all'], 100 * r['w_concept'],
+              ('%7.1f%%' % (100 * r['w_key'])) if r['w_key'] is not None else '-', r['n10'], r['n50'], top))
+    if args.csv:
+        with open(args.csv, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['shock', 'type', 'description', 'importance_all_vars', 'importance_by_concept',
+                        'importance_key_vars', 'vars_explained_10pct', 'vars_explained_50pct', 'variables_it_feeds'])
+            for r in rows:
+                w.writerow([r['id'], r['type'], r['desc'], _r(r['w_all'], 4), _r(r['w_concept'], 4), _r(r['w_key'], 4),
+                            r['n10'], r['n50'], r['reach']])
+        base = os.path.splitext(args.csv)[0] + '_matrix.csv'
+        with open(base, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['variable', 'description', 'shock', 'share_of_gap'])
+            for y in sorted(share):
+                for sid, v in sorted(share[y].items(), key=lambda kv: -abs(kv[1])):
+                    if abs(v) >= 0.01:
+                        w.writerow([y, M.desc.get(y, ''), sid, _r(v, 4)])
+        print('\nRanking written to %s; every variable x shock share (>=1%%) to %s' % (args.csv, base))
+
+
+def cmd_check(M, args):
+    write_check(M, args.out)
+
+
 def cmd_influence(M, args):
     shock = parse_shock(args.shock)
     reach = M.reach_counts()
@@ -2437,11 +3109,19 @@ def build_data(M, args, eqstats, serve=False):
         p = _dec_payload(M, n)
         if p:
             dec[n] = p
-    esh, afsh = {}, {}
+    esh, afsh, eshp = {}, {}, {}
+    pg = {}
+    for n in M.differs:  # gap in % of A, every quarter of the window
+        a, b = M.series(n, 'a'), M.series(n, 'b')
+        pg[n] = [_r((b[t] - a[t]) / abs(a[t]) * 100, 3) if (a[t] == a[t] and b[t] == b[t] and a[t]) else None
+                 for t in range(M.ws, M.we + 1)]
     for n, d in M._dd.items():
         if not d or 'error' in d or n not in nidx:
             continue
         esh[str(nidx[n])] = [[nidx[k], _r(v, 3)] for k, v in d['shares'].items() if k in nidx and v is not None]
+        ps = d.get('pshare')
+        if ps:
+            eshp[str(nidx[n])] = [[nidx[k], v] for k, v in ps.items() if k in nidx and any(x is not None for x in v)]
         if d['af_changed'] and d['af_share_end'] is not None:
             afsh[str(nidx[n])] = _r(d['af_share_end'], 3)
     reach = M.reach_counts() if M.has_eqs else {}
@@ -2456,14 +3136,24 @@ def build_data(M, args, eqstats, serve=False):
             r['top'] = [[n, _r(v), _r(p, 4), lab] for n, v, p, lab in r['top']]
             infl[x] = r
         log('  influence of %d scenario shocks in %.1fs' % (len(infl), time.time() - t1))
+    summ = build_summary(M, args, log) if M.has_eqs and getattr(args, 'summary_n', 8) > 0 else None
+    imp_payload = None
+    if M.has_eqs and getattr(args, 'importance', True):
+        res, share, targets = compute_importance(M, getattr(args, 'max_shocks', 0), summ['keys'] if summ else None, log)
+        imp_payload = {
+            'n_targets': len(targets),
+            'shocks': [[r['id'], r['type'], r['desc'], _r(r['w_all'], 4), _r(r['w_concept'], 4),
+                        _r(r['w_key'], 4) if r['w_key'] is not None else None, r['n10'], r['n50'], r['reach'],
+                        [[y, _r(v, 3)] for y, v in r['top']]] for r in res.values()],
+            'by_var': {y: [[sid, _r(v, 3)] for sid, v in sorted(d.items(), key=lambda kv: -abs(kv[1]))[:6]]
+                       for y, d in share.items()}}
     eqt = {n: M.eqs[n].text[:700] for n in nodes if n in M.eqs and (n in seen or n in M.differs)}
     for n, e in M.exog.items():
         eqt[n] = e.text[:700]
     why = {n: M.eqs[n].why for n in eqt if n in M.eqs and M.eqs[n].why}
 
     geo_rows, stem_rows = [], []
-    with_sep = sum(1 for n in M.common if M.geo(n))
-    if with_sep >= 0.3 * max(1, len(M.common)):
+    if len(M.geo_codes) >= 2:
         def grp_ok(n):  # add-factor series are counted through the variable they adjust
             return not (M.has_eqs and M.kind(n) == 'F')
         g_all, s_all = Counter(), defaultdict(set)
@@ -2510,9 +3200,10 @@ def build_data(M, args, eqstats, serve=False):
                  'exog': sorted(M.exog)},
         'per': per, 'wsi': M.ws - es,
         'rows': rows, 'entry': entry, 'nodes': nodes, 'par': par,
-        'vals': vals, 'dec': dec, 'esh': esh, 'afsh': afsh,
+        'vals': vals, 'dec': dec, 'esh': esh, 'afsh': afsh, 'eshp': eshp, 'pg': pg,
         'reach': [reach.get(n, 0) for n in nodes], 'infl': infl,
-        'summary': build_summary(M, args, log) if M.has_eqs and getattr(args, 'summary_n', 8) > 0 else None, 'eqt': eqt, 'why': why,
+        'summary': summ,
+        'imp': imp_payload, 'eqt': eqt, 'why': why,
         'afmap': {k: v for k, v in M.af.items()},
         'afrows': _af_rows(M) if M.has_eqs else [],
         'geo': geo_rows, 'stem': stem_rows,
@@ -2527,6 +3218,97 @@ def _pct_word(p):
     if p is None or p != p:
         return 'n/a'
     return '%+.2f%%' % p
+
+
+def compute_importance(M, max_shocks=None, keys=None, log=lambda m: None):
+    """Relative importance of every scenario shock.
+
+    Shocks = changed exogenous variables (no equation, or set by the team) and changed add-factors.
+    For each shock alone: re-solve every equation it feeds, with everything else at scenario A, and
+    take its effect e_t on each variable. Its share of variable y's gap g_t over the whole window is
+        share = sum_t e_t * g_t / sum_t g_t^2
+    (the part of y's gap path that the shock reproduces). Shares of all shocks add up to ~1 for each
+    variable (exactly 1 if the model is linear). Importance = weighted average of the shares over the
+    variables that moved."""
+    t0 = time.time()
+    rng = range(M.ws, M.we + 1)
+    shocks = []   # (id, kind, series)
+    seen = set()
+    for n in sorted(M.differs_any):
+        if n in M.eqs and M.eqs[n].evaluable:
+            continue
+        if n in M.af_series and M.af_target(n):
+            continue                      # counted through its equation's add-factor below
+        if n in M.children or n in M.exog:
+            shocks.append((n, 'data', n))
+            seen.add(n)
+    for n in sorted(M.eqs):
+        if M.eqs[n].evaluable and n in M.differs_any:
+            d = M.dyn(n)
+            if d and 'error' not in d and d['af_changed']:
+                shocks.append(('AF:' + n, 'addfactor', n))
+    # cheap ones first, so a cap keeps the broad ones... rank by size of what they feed
+    reach = M.reach_counts()
+    if max_shocks and len(shocks) > max_shocks:
+        shocks.sort(key=lambda x: -(reach.get(x[2], 0) + 1) * (M.stats.get(x[2], {}).get('score', 0) or 1))
+        shocks = shocks[:max_shocks]
+    targets = [n for n in M.differs if n in M.eqs and M.eqs[n].evaluable]
+    tset = set(targets)
+    gap = {}
+    for y in targets:
+        a, b = M.series(y, 'a'), M.series(y, 'b')
+        gap[y] = [(b[t] - a[t]) if (a[t] == a[t] and b[t] == b[t]) else 0.0 for t in rng]
+    g2 = {y: sum(v * v for v in g) for y, g in gap.items()}
+    share = defaultdict(dict)    # y -> {shock: share}
+    for k, (sid, kind, sname) in enumerate(shocks):
+        if kind == 'data':
+            nodes = M.descendants(sname)
+            ev = [n for n in nodes if n in M.eqs and M.eqs[n].evaluable]
+            try:
+                sim = M.simulate(ev, override={sname: M.series(sname, 'b')})
+            except EvalError:
+                continue
+        else:
+            nodes = M.descendants(sname) | {sname}
+            ev = [n for n in nodes if n in M.eqs and M.eqs[n].evaluable]
+            try:
+                sim = M.simulate(ev, resid_b={sname})
+            except EvalError:
+                continue
+        for y in ev:
+            if y not in tset or not g2[y]:
+                continue
+            a = M.series(y, 'a')
+            s_ = sim[y]
+            num = 0.0
+            for i, t in enumerate(rng):
+                e = s_[t] - a[t]
+                if e == e:
+                    num += e * gap[y][i]
+            sh = num / g2[y]
+            if abs(sh) >= 1e-4:
+                share[y][sid] = sh
+        if (k + 1) % 50 == 0:
+            log('  importance: %d / %d shocks (%.0fs)' % (k + 1, len(shocks), time.time() - t0))
+    # weights
+    conc = Counter(M.stem(y) for y in targets)
+    keyset = set(keys or ())
+    res = {}
+    for sid, kind, sname in shocks:
+        sh = {y: d[sid] for y, d in share.items() if sid in d}
+        ys = [y for y in targets]
+        eq_w = sum(sh.get(y, 0.0) for y in ys) / max(1, len(ys))
+        cw = sum(sh.get(y, 0.0) / conc[M.stem(y)] for y in ys) / max(1, len(conc))
+        kw = (sum(sh.get(y, 0.0) for y in keyset if y in tset) / max(1, len(keyset & tset))) if keyset else None
+        res[sid] = {'id': sid, 'kind': kind, 'series': sname, 'type': 'set by team' if sname in M.exog else
+                    ('add-factor' if kind == 'addfactor' else 'exogenous'),
+                    'desc': M.desc.get(sname, ''), 'reach': len(M.descendants(sname)) + (1 if kind == 'addfactor' else 0),
+                    'w_all': eq_w, 'w_concept': cw, 'w_key': kw,
+                    'n10': sum(1 for v in sh.values() if abs(v) >= 0.10),
+                    'n50': sum(1 for v in sh.values() if abs(v) >= 0.50),
+                    'top': sorted(sh.items(), key=lambda kv: -abs(kv[1]))[:25]}
+    log('  importance of %d shocks over %d variables in %.1fs' % (len(shocks), len(targets), time.time() - t0))
+    return res, share, targets
 
 
 def pick_key_vars(M, user=None, n=8):
@@ -2739,6 +3521,8 @@ def render_html(M, data):
 
 
 def build_report(M, args, eqstats):
+    if M.has_eqs:
+        write_check(M, os.path.splitext(args.out)[0] + '_not_evaluable.csv', quiet=not M.verbose)
     data, _ = build_data(M, args, eqstats)
     out = render_html(M, data)
     with open(args.out, 'w', encoding='utf-8') as f:
@@ -2911,6 +3695,7 @@ svg text{fill:var(--mut);font-size:11px}
 <section id="t-top" class="hide"></section>
 <section id="t-entry" class="hide"></section>
 <section id="t-afx" class="hide"></section>
+<section id="t-imp" class="hide"></section>
 <section id="t-inf" class="hide"></section>
 <section id="t-stem" class="hide"></section>
 <section id="t-geo" class="hide"></section>
@@ -2939,8 +3724,8 @@ function desc(n){const r=ROW[n];return r?r[1]:(D.desc[n]||'')}
 document.addEventListener('click',e=>{const a=e.target.closest('[data-v]');if(a){e.preventDefault();show(a.dataset.v)}});
 
 // ---------- tabs
-const TABS=[['story','Summary'],['sum','Overview'],['top','Key changes'],['entry','Where B starts'],['afx','Formula vs add-factor'],['stem','By concept'],['geo','By geography'],['inf','Influence'],['path','Impact X → Y']];
-$('#tabs').innerHTML=TABS.filter(t=>t[0]==='story'?D.summary:t[0]==='afx'?D.afrows.length:t[0]==='inf'?M.has_eqs:(t[0]!=='stem'&&t[0]!=='geo')||D[t[0]].length).map(t=>`<button data-t="${t[0]}">${t[1]}</button>`).join('');
+const TABS=[['story','Summary'],['sum','Overview'],['top','Key changes'],['entry','Where B starts'],['afx','Formula vs add-factor'],['stem','By concept'],['geo','By geography'],['imp','Importance'],['inf','Influence'],['path','Impact X → Y']];
+$('#tabs').innerHTML=TABS.filter(t=>t[0]==='story'?D.summary:t[0]==='imp'?D.imp:t[0]==='afx'?D.afrows.length:t[0]==='inf'?M.has_eqs:(t[0]!=='stem'&&t[0]!=='geo')||D[t[0]].length).map(t=>`<button data-t="${t[0]}">${t[1]}</button>`).join('');
 function tab(t){document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));TABS.forEach(x=>$('#t-'+x[0]).classList.toggle('hide',x[0]!==t))}
 $('#tabs').addEventListener('click',e=>{if(e.target.dataset.t)tab(e.target.dataset.t)});
 $('#sub').innerHTML=`<b>A</b> = ${esc(M.a)} &nbsp; vs &nbsp; <b>B</b> = ${esc(M.b)} &nbsp;·&nbsp; window ${M.ws}–${M.we} &nbsp;·&nbsp; generated ${M.generated}`;
@@ -3078,6 +3863,24 @@ let KC={};
   $('#amore').innerHTML=rs.length>lim?`<button class="btn" id="am2">Show all ${rs.length.toLocaleString()}</button>`:'';if(rs.length>lim)$('#am2').onclick=()=>{lim=rs.length;r()}};
  ['aq','am','as','amode','asl'].forEach(id=>$('#'+id).addEventListener('input',()=>{if(id!=='asl')lim=500;r()}));r()})();
 
+// ---------- importance
+(function(){const I=D.imp;if(!I)return;
+ const lab=id=>id.startsWith('AF:')?'add-factor on '+id.slice(3):id,lk=id=>id.startsWith('AF:')?`<i>add-factor on</i> ${vlink(id.slice(3))}`:vlink(id);
+ $('#t-imp').innerHTML=`<div class="hint">Which shocks matter most? Each <b>shock</b> is a changed exogenous variable (no equation, or set by the team) or a changed add-factor. Each one is switched from A to B <i>on its own</i>, everything it feeds is re-solved, and for each of the ${I.n_targets.toLocaleString()} variables that moved we measure the share of its gap the shock explains (whole window: Σ effect·gap / Σ gap²). For each variable, the shares of all shocks add up to about 100%. <b>Importance</b> = the average of those shares across variables.</div>
+ <div class="ctl"><label class="small mut">Weight variables <select id="iw"><option value="4">by concept (each concept counts once, so 50 state copies don't dominate)</option><option value="3">all equally</option>${I.shocks.some(r=>r[5]!=null)?'<option value="5">key variables only (Summary tab)</option>':''}</select></label><select id="it"><option value="">All shock types</option><option>exogenous</option><option>add-factor</option><option>set by team</option></select><input type="text" id="iq" placeholder="Search"></div>
+ <div id="ichart"></div><div class="tw"><table><thead><tr><th>#</th><th>Shock</th><th>Type</th><th>Description</th><th class="n">Importance</th><th class="n" title="Number of variables where this shock explains at least 10% of the gap">Explains ≥10% of</th><th class="n">≥50% of</th><th class="n">Variables it feeds</th><th>Explains most of</th></tr></thead><tbody id="itb"></tbody></table></div>
+ <h2>Look up a variable</h2><div class="ctl"><input type="text" id="iv" placeholder="Variable, e.g. FGDP$_ICAN"><button class="btn" id="ivgo">Show its main shocks</button></div><div id="ivout"></div>`;
+ const r=()=>{const c=+$('#iw').value,ty=$('#it').value,q=$('#iq').value.trim().toUpperCase();
+  const rs=I.shocks.filter(x=>(!ty||x[1]===ty)&&(!q||x[0].includes(q)||x[2].toUpperCase().includes(q))).slice().sort((a,b)=>Math.abs(b[c]||0)-Math.abs(a[c]||0));
+  const top=rs.slice(0,20),mx=Math.max(1e-9,...top.map(x=>Math.abs(x[c]||0)));
+  $('#ichart').innerHTML=`<table class="bars">${top.map(x=>`<tr><td style="width:30%">${lk(x[0])}</td><td style="width:50%">${bar(x[c]||0,mx)}</td><td class="n"><b>${x[c]==null?'–':(100*x[c]).toFixed(1)+'%'}</b></td></tr>`).join('')}</table>`;
+  $('#itb').innerHTML=rs.slice(0,1000).map((x,i)=>`<tr><td class="mut">${i+1}</td><td>${lk(x[0])}</td><td class="small">${esc(x[1])}</td><td class="small">${esc(x[2]).slice(0,50)}</td><td class="n"><b>${x[c]==null?'–':(100*x[c]).toFixed(1)+'%'}</b></td><td class="n">${x[6].toLocaleString()}</td><td class="n">${x[7].toLocaleString()}</td><td class="n mut">${x[8].toLocaleString()}</td><td class="small">${x[9].slice(0,3).map(t=>vlink(t[0])+' '+Math.round(100*t[1])+'%').join(', ')}</td></tr>`).join('')};
+ ['iw','it','iq'].forEach(id=>$('#'+id).addEventListener('input',r));r();
+ const lv=()=>{const v=$('#iv').value.trim().toUpperCase(),l=I.by_var[v];
+  $('#ivout').innerHTML=!l?`<div class="card">${esc(v)}: no shares (it did not move, has no evaluable equation, or is itself a shock). ${sugg(v)}</div>`:`<div class="hint">Share of ${esc(v)}'s gap (whole window) explained by each shock on its own:</div><table class="bars">${l.map(t=>`<tr><td style="width:40%">${lk(t[0])}</td><td style="width:40%">${bar(t[1],Math.max(...l.map(z=>Math.abs(z[1]))))}</td><td class="n"><b>${Math.round(100*t[1])}%</b></td></tr>`).join('')}</table>`};
+ $('#ivgo').onclick=lv;$('#iv').addEventListener('keydown',e=>{if(e.key==='Enter')lv()});
+})();
+
 // ---------- influence
 function infSummary(r,what){return `<div class="kpis"><div class="kpi"><span class="mut small">linked through equations</span><b>${r.reach.toLocaleString()}</b></div><div class="kpi"><span class="mut small">actually move (≥${r.thr}%)</span><b>${r.moved.toLocaleString()}</b></div><div class="kpi"><span class="mut small">move ≥ 1%</span><b>${r.ge1.toLocaleString()}</b></div><div class="kpi"><span class="mut small">0.1–1%</span><b>${r.b01.toLocaleString()}</b></div><div class="kpi"><span class="mut small">${r.thr}–0.1%</span><b>${r.b001.toLocaleString()}</b></div></div>
  <div class="hint">${what}. ${r.resolved.toLocaleString()} equations re-solved${r.blocked?`; ${r.blocked} linked variables have no evaluable equation and were held fixed`:''}. Largest effect over ${esc(M.ws)}–${esc(M.we)}, as % of the scenario-A level:</div>
@@ -3128,9 +3931,21 @@ function prodOf(p){let pr=1;for(let j=1;j<p.length;j++){const sh=esh(p[j],p[j-1]
 function rankedPaths(x,y,k){const ps=findPaths(x,y,40),sp=strongest(x,y);if(sp&&!ps.some(p=>p.join()===sp.join()))ps.push(sp);
  ps.sort((a,b)=>{const pa=prodOf(a),pb=prodOf(b);return (pb==null?-1:Math.abs(pb))-(pa==null?-1:Math.abs(pa))});return ps.slice(0,k)}
 function gapTxt(n){const r=ROW[n];if(!r)return'<span class="mut">no change</span>';if(r[7]==null)return `<span class="${cls(r[4])} small">max gap ${fmt(r[4])} (${esc(r[8])})</span>`;return `<span class="${cls(r[7])}">${pct(r[7])}</span>`}
+function eshq(child,parent,i){const l=D.eshp[NI[child]];if(!l)return null;const p=NI[parent];for(const e of l)if(e[0]===p)return e[1][i]==null?null:e[1][i]/1000;return null}
+function gapQ(n,i){const g=D.pg[n];if(!g)return'<span class="mut">no change</span>';const v=g[i];return v==null?'<span class="mut">–</span>':`<span class="${cls(v)}">${pct(v)}</span>`}
+let PATHS=null;
+function pathsQ(i){const {x,y,ps}=PATHS,WP=D.per.length-D.wsi;
+ const prodQ=(p,k)=>{let pr=1;for(let j=1;j<p.length;j++){const sh=eshq(p[j],p[j-1],k);if(sh==null)return null;pr*=sh}return pr};
+ const ord=ps.map(p=>[p,prodQ(p,i)]).sort((a,b)=>(b[1]==null?-1:Math.abs(b[1]))-(a[1]==null?-1:Math.abs(a[1])));
+ return ord.map(([p,prod],k)=>{const st=p.map((n,j)=>{let s='';if(j>0){const sh=eshq(n,p[j-1],i);s=sh==null?'<span class="mut small">share n/a (no gap this quarter)</span>':`<span class="small">${Math.round(sh*100)}% of its gap from ${esc(p[j-1])}</span>`}return `<span class="step">${j?'<span class="arrow">→</span>':''}${vlink(n)} ${gapQ(n,i)} ${s}</span>`}).join('<br>');
+  const series=[...Array(WP).keys()].map(q=>{const v=prodQ(p,q);return v==null?null:100*v});
+  return `<div class="path"><b>Path ${k+1}</b>${k===0&&ord.length>1?' <span class="small mut">(ordered by how much of the change they carry in this quarter)</span>':''}<br>${st}${p.length>1?`<div class="hint">${prod==null?'Share along this channel not available in this quarter.':`≈ <b>${Math.round(prod*100)}%</b> of ${esc(y)}'s change at ${esc(D.per[D.wsi+i])} travels along this channel (product of the link shares, approximate).`}</div>`+lineChart2(series,null,D.per.slice(D.wsi),'share of '+y+'\'s gap along this channel, %','',i):''}</div>`}).join('')}
 function pathHTML(x,y){
  const ps=rankedPaths(x,y,6);
  if(!ps.length){const rev=findPaths(y,x,1);return `<div class="card">${esc(x)} does not feed into ${esc(y)} through the loaded equations.${rev.length?` The reverse holds: ${rev[0].map(vlink).join(' → ')}.`:''}</div>`}
+ if(D.eshp&&Object.keys(D.eshp).length){const WP=D.per.length-D.wsi;PATHS={x,y,ps};
+  setTimeout(()=>{const sl=$('#csl');if(!sl)return;const f=()=>{$('#clab').textContent=D.per[D.wsi+(+sl.value)];$('#cbody').innerHTML=pathsQ(+sl.value)};sl.addEventListener('input',f);f()},0);
+  return `<div class="ctl" style="align-items:center"><span class="small mut">Quarter</span><input type="range" id="csl" min="0" max="${WP-1}" value="${WP-1}" style="flex:1;min-width:200px"><b id="clab"></b></div><div id="cbody"></div>`}
  return ps.map((p,i)=>{let prod=1,ok=true;const st=p.map((n,j)=>{let s='';if(j>0){const sh=esh(n,p[j-1]);if(sh==null){ok=false;s='<span class="mut small">share n/a</span>'}else{prod*=sh;s=`<span class="small">${Math.round(sh*100)}% of its gap from ${esc(p[j-1])}</span>`}}return `<span class="step">${j?'<span class="arrow">→</span>':''}${vlink(n)} ${gapTxt(n)} ${s}</span>`}).join('<br>');
   return `<div class="path"><b>Path ${i+1}</b>${i===0&&ps.length>1?' <span class="small mut">(paths ordered by how much of the change they carry)</span>':''}<br>${st}${ok&&p.length>1?`<div class="hint">≈ ${Math.round(prod*100)}% of ${esc(y)}'s change travels along this channel (product of the link shares, approximate).</div>`:''}</div>`}).join('')}
 function upHTML(x,depth){const xi=NI[x];const dist=new Map([[xi,0]]),nxt=new Map(),q=[xi];
@@ -3356,7 +4171,8 @@ def main(argv=None):
         sp.add_argument('--start', help='first period to compare (default: where scenarios first diverge)')
         sp.add_argument('--end', help='last period to compare (default: end of data)')
         sp.add_argument('--tol', type=float, default=1e-6, help='relative tolerance for "differs" (default 1e-6)')
-        sp.add_argument('--geo-sep', default='.', help='separator before geography code in names (default ".")')
+        sp.add_argument('--geo-sep', default='auto',
+                        help='separator before the geography code: "." (FGDP.ICAN), "_" (FGDP_ICAN) or auto (default)')
         sp.add_argument('--adj-threshold', type=float, default=0.25,
                         help='flag a variable as "mostly add-factor" above this share of its change (0.25)')
         sp.add_argument('--exog', action='append', metavar='LIST',
@@ -3377,6 +4193,10 @@ def main(argv=None):
                         help='key variables for the Summary tab (file or comma list); default: picked automatically')
         sp.add_argument('--summary-n', type=int, default=8,
                         help='how many key variables to pick automatically for the Summary tab (default 8; 0 = off)')
+        sp.add_argument('--no-importance', dest='importance', action='store_false',
+                        help='skip the Importance tab (it re-solves the model once per scenario shock)')
+        sp.add_argument('--max-shocks', type=int, default=0,
+                        help='Importance tab: only the N broadest shocks (0 = all)')
         sp.add_argument('--influence-n', type=int, default=20,
                         help='scenario shocks whose influence is simulated for the Influence tab (default 20)')
 
@@ -3438,6 +4258,19 @@ def main(argv=None):
     common(sp)
     sp.add_argument('-k', type=int, default=5, help='max number of paths')
 
+    sp = sub.add_parser('importance', help='rank the scenario shocks by how much of all variables they explain')
+    common(sp)
+    sp.add_argument('--weight', choices=['all', 'concept', 'key'], default='concept',
+                    help='average over all variables, per concept (each concept counts once), or key variables (default concept)')
+    sp.add_argument('--max-shocks', type=int, default=0, help='only the N broadest shocks (0 = all)')
+    sp.add_argument('--csv', help='write the ranking, and every variable x shock share, to CSV')
+    sp.add_argument('-n', type=int, default=30)
+    sp.add_argument('--key', action='append', metavar='LIST', help='key variables for the "key" weighting')
+
+    sp = sub.add_parser('check', help='list equations that cannot be used, with the reason, in a CSV')
+    common(sp)
+    sp.add_argument('-o', '--out', default='not_evaluable.csv')
+
     sp = sub.add_parser('info', help='show what was loaded and parsed')
     common(sp)
 
@@ -3468,6 +4301,10 @@ def main(argv=None):
         cmd_attribute(M, args)
     elif args.cmd == 'influence':
         cmd_influence(M, args)
+    elif args.cmd == 'importance':
+        cmd_importance(M, args)
+    elif args.cmd == 'check':
+        cmd_check(M, args)
     return 0
 
 
