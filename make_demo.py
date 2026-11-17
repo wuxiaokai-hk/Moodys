@@ -17,6 +17,18 @@ import scenario_compare as sc  # noqa: E402
 N_GEO = int(sys.argv[1]) if len(sys.argv) > 1 else 50
 N_FILL = int(sys.argv[2]) if len(sys.argv) > 2 else 800
 OUT = sys.argv[3] if len(sys.argv) > 3 else 'demo'
+STYLE = sys.argv[4] if len(sys.argv) > 4 else 'dot'   # 'dot': FGDP$.IUSA   'underscore': FGDP$_IUSA
+
+
+def NM(n):
+    return n.replace('.', '_') if STYLE == 'underscore' else n
+
+
+def EQ(txt):
+    if STYLE != 'underscore':
+        return txt
+    import re as _re
+    return _re.sub(r'([A-Za-z$]+[A-Za-z0-9$]*)\.(I[A-Z0-9]+)', r'\1_\2', txt)
 os.makedirs(OUT, exist_ok=True)
 random.seed(7)
 
@@ -164,7 +176,7 @@ def desc(n):
 with open(os.path.join(OUT, 'baseline.csv'), 'w') as f:
     f.write('Mnemonic,Description,' + ','.join(periods) + '\n')
     for n in names:
-        f.write('%s,"%s",' % (n, desc(n)) + ','.join('%.6f' % v for v in A[n]) + '\n')
+        f.write('%s,"%s",' % (NM(n), desc(n)) + ','.join('%.6f' % v for v in A[n]) + '\n')
 
 
 # Scenario B: XLSX, Data Buffet style (description + mnemonic rows, dates down column A)
@@ -190,7 +202,7 @@ def xlsx(path, rows):
         z.writestr('xl/worksheets/sheet1.xml', '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>%s</sheetData></worksheet>' % body)
 
 
-rows = [['Description:'] + [desc(n) for n in names], ['Mnemonic:'] + names, ['Source:'] + ['Moody\'s demo'] * len(names)]
+rows = [['Description:'] + [desc(n) for n in names], ['Mnemonic:'] + [NM(n) for n in names], ['Source:'] + ['Moody\'s demo'] * len(names)]
 for t, p in enumerate(periods):
     rows.append([p] + [round(B[n][t], 6) for n in names])
 xlsx(os.path.join(OUT, 'alt_scenario.xlsx'), rows)
@@ -200,10 +212,10 @@ with open(os.path.join(OUT, 'equations.txt'), 'w') as f:
     for txt, _ in eqs:
         if txt.startswith('DLOG(FC$.IUSA)'):  # split over two lines on purpose
             l, r = txt.split(' - 0.002')
-            f.write(l + '\n   - 0.002' + r + '\n')
+            f.write(EQ(l) + '\n   - 0.002' + EQ(r) + '\n')
         else:
-            f.write(txt + '\n')
-    f.write("eq_fc.ls dlog(fc$.iusa) c dlog(fypdpi$.iusa) d(frgt10y.iusa)\n")  # spec duplicate
-    f.write("@ADD(V) FC$.IUSA FC$.IUSA_A\n")
+            f.write(EQ(txt) + '\n')
+    f.write(EQ("eq_fc.ls dlog(fc$.iusa) c dlog(fypdpi$.iusa) d(frgt10y.iusa)\n"))  # spec duplicate
+    f.write(EQ("@ADD(V) FC$.IUSA FC$.IUSA_A\n"))
     f.write("smpl 2026q1 2030q4\n")
 print('demo written to', OUT, '-', len(names), 'series,', len(eqs), 'equations')

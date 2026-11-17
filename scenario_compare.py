@@ -13,6 +13,7 @@ Commands
   addfactors  formula vs add-factor share of the gap, for every equation
   impact    can X affect Y, and by how much? (re-solves the equations with only X changed)
   attribute split the gap of Y across every scenario shock upstream of it
+  influence if X changes, how many variables move and by how much
   path      the channels through which X reaches Y
   serve     the report in your browser, plus exact impact / attribution on demand
   info      what was loaded (layout detected, periods, equations parsed)
@@ -1080,7 +1081,7 @@ def parse_shock(s):
 
 class Model:
     def __init__(self, A, B, eqs=None, addlinks=None, start=None, end=None, tol=1e-6,
-                 geo_sep='.', adj_threshold=0.25, meta=None, verbose=True, af_suffix='_A'):
+                 geo_sep='.', adj_threshold=0.25, meta=None, verbose=True, af_suffix='_A', exog=None):
         t0 = time.time()
         self.A, self.B = A, B
         self.tol = tol
@@ -1099,7 +1100,16 @@ class Model:
         self.desc.update(A.desc)
         if meta:
             self.desc.update(meta)
-        self.eqs = eqs or {}
+        self.eqs = dict(eqs or {})
+        # variables the team set exogenously: keep their equation for display, but treat them as
+        # assumptions (no equation): never re-solved, so shocks stop there
+        self.exog = {}
+        self.exog_missing = []
+        for n in (exog or ()):
+            if n in self.eqs:
+                self.exog[n] = self.eqs.pop(n)
+            else:
+                self.exog_missing.append(n)
         self.addlinks = addlinks or {}
         self.has_eqs = bool(self.eqs)
         self.common = sorted(set(self.a) & set(self.b))
@@ -1245,12 +1255,22 @@ class Model:
                     tend=last, score=min(1e6, maxabs / self._scale(a, b)) if differs else 0.0, differs=differs,
                     first=self.first_div.get(n))
 
+    def _base_name(self, n):
+        """Add-factor series are grouped with the variable they adjust (FC_IUSA_A -> FC_IUSA)."""
+        for suf in getattr(self, 'af_suffixes', ()):
+            if n.endswith(suf) and n[:-len(suf)] and (n[:-len(suf)] in self.a or n[:-len(suf)] in self.b
+                                                     or n[:-len(suf)] in self.eqs):
+                return n[:-len(suf)]
+        return n
+
     def geo(self, n):
+        n = self._base_name(n)
         if self.geo_sep and self.geo_sep in n:
             return n.rsplit(self.geo_sep, 1)[1]
         return ''
 
     def stem(self, n):
+        n = self._base_name(n)
         if self.geo_sep and self.geo_sep in n:
             return n.rsplit(self.geo_sep, 1)[0]
         return n
@@ -1318,7 +1338,11 @@ class Model:
     def _form(self, n):
         f = self._lform.get(n)
         if f is None:
-            f = self._lform[n] = lhs_form(self.eqs[n])
+            eq = self.eqs[n]
+            # Y also appears on the right-hand side in the same quarter (e.g. @MOVAV(Y,4)):
+            # both sides must be solved together
+            f = 'implicit' if n in ast_contemp(eq.rhs) else lhs_form(eq)
+            self._lform[n] = f
         return f
 
     def _cont(self, n):
@@ -1352,8 +1376,12 @@ class Model:
 
     def _solve(self, n, get, arr, t, res):
         eq = self.eqs[n]
-        target = evaluate(eq.rhs, get, t, t, self.ppy)[0] + res
         f = self._form(n)
+        if f == 'implicit':
+            y = self._secant_implicit(eq, get, arr, t, res)
+            arr[t] = y
+            return y
+        target = evaluate(eq.rhs, get, t, t, self.ppy)[0] + res
         if f == 'level':
             y = target
         elif f == 'dlog':
@@ -1366,6 +1394,31 @@ class Model:
             y = self._secant(eq, get, arr, t, target)
         arr[t] = y
         return y
+
+    def _secant_implicit(self, eq, get, arr, t, res):
+        """Solve LHS(y) - RHS(y) - res = 0 when y appears on both sides in the same quarter."""
+        def fn(y):
+            arr[t] = y
+            return evaluate(eq.lhs, get, t, t, self.ppy)[0] - evaluate(eq.rhs, get, t, t, self.ppy)[0] - res
+        y0 = arr[t]
+        if y0 != y0:
+            y0 = arr[t - 1] if t > 0 and arr[t - 1] == arr[t - 1] else 1.0
+        f0 = fn(y0)
+        if f0 != f0:
+            return NAN
+        if abs(f0) < 1e-13 * (1 + abs(y0)):
+            return y0
+        y1 = y0 * (1 + 1e-4) + 1e-8
+        f1 = fn(y1)
+        for _ in range(60):
+            if f1 != f1 or f1 == f0:
+                break
+            y2 = y1 - f1 * (y1 - y0) / (f1 - f0)
+            y0, f0, y1 = y1, f1, y2
+            f1 = fn(y1)
+            if abs(f1) < 1e-12 * (1 + abs(y1)) or abs(y1 - y0) < 1e-13 * (1 + abs(y1)):
+                break
+        return y1
 
     def _secant(self, eq, get, arr, t, target):
         def fn(y):
@@ -1501,10 +1554,26 @@ class Model:
                    inter_end=inter[iend], shares={d: sh(v) for d, v in end.items()},
                    af_share_end=sh(afe) if af else None, formula_share_end=sh(sum(end.values())),
                    af_share=absaf / (absaf + absd) if absaf + absd > 1e-15 else 0.0,
-                   af_name=self.af.get(n), af_changed=af is not None, fit_err=fit)
+                   af_name=self.af.get(n), af_changed=af is not None, fit_err=fit,
+                   pgap=gap, pf=[sum(c[i] for c in contrib.values() if c[i] == c[i]) for i in range(len(gap))],
+                   paf=af)
         if periods:
             out.update(contrib=contrib, af=af, inter=inter, gap=gap)
         return out
+
+    def change_class(self, n):
+        """D = changed directly (an assumption, an add-factor series, or its equation's add-factor changed);
+        M = moved only through its formula (same equation, same add-factor, its inputs moved);
+        U = cannot tell (equation not evaluable); '' = no equations loaded."""
+        if not self.has_eqs:
+            return ''
+        k = self.kind(n)
+        if k in ('X', 'F'):
+            return 'D'
+        if k == 'N':
+            return 'U'
+        d = self.dyn(n)
+        return 'D' if d and d.get('af_changed') else 'M'
 
     def share(self, child, parent):
         d = self.dyn(child)
@@ -1603,6 +1672,133 @@ class Model:
         gap = [Bv[t] - A[t] for t in rng]
         return res, joint, gap
 
+    # ---- influence: how many variables a change in X reaches, and by how much
+    def reach_counts(self):
+        """Number of variables each variable feeds, directly or indirectly (via the equations)."""
+        if getattr(self, '_reach', None) is not None:
+            return self._reach
+        nodes = sorted(set(self.children) | set(self.eqs) | set(self.a) | set(self.b))
+        idx = {n: i for i, n in enumerate(nodes)}
+        ch = [[idx[c] for c in self.children.get(n, ()) if c in idx] for n in nodes]
+        # iterative Tarjan SCC (components come out in reverse topological order)
+        N = len(nodes)
+        index, low, onst, comp = [None] * N, [0] * N, [False] * N, [-1] * N
+        stack, comps, counter = [], [], 0
+        for root in range(N):
+            if index[root] is not None:
+                continue
+            work = [(root, 0)]
+            while work:
+                v, pi = work.pop()
+                if pi == 0:
+                    index[v] = low[v] = counter
+                    counter += 1
+                    stack.append(v)
+                    onst[v] = True
+                recurse = False
+                for k in range(pi, len(ch[v])):
+                    w = ch[v][k]
+                    if index[w] is None:
+                        work.append((v, k + 1))
+                        work.append((w, 0))
+                        recurse = True
+                        break
+                    elif onst[w]:
+                        low[v] = min(low[v], index[w])
+                if recurse:
+                    continue
+                if low[v] == index[v]:
+                    c = []
+                    while True:
+                        w = stack.pop()
+                        onst[w] = False
+                        comp[w] = len(comps)
+                        c.append(w)
+                        if w == v:
+                            break
+                    comps.append(c)
+                if work:
+                    u = work[-1][0]
+                    low[u] = min(low[u], low[v])
+        # reach bitsets per component, children components come first
+        reach = [0] * len(comps)
+        for ci, c in enumerate(comps):
+            bits = 0
+            for v in c:
+                for w in ch[v]:
+                    cw = comp[w]
+                    bits |= reach[cw] | (1 << w)
+            if len(c) > 1:
+                for v in c:
+                    bits |= 1 << v
+            reach[ci] = bits
+        out = {}
+        for n, i in idx.items():
+            b = reach[comp[i]] & ~(1 << i)
+            out[n] = bin(b).count('1')
+        self._reach = out
+        return out
+
+    def af_target(self, x):
+        """If x is an add-factor series attached to an equation (not written inside it), its target."""
+        if not hasattr(self, '_af_rev'):
+            self._af_rev = {v: k for k, v in self.af.items() if v not in self.eqs[k].drivers}
+        return self._af_rev.get(x)
+
+    def shock_mode(self, x, shock):
+        """How to apply 'X changes as in scenario B': an add-factor series or an equation driven mostly by
+        its add-factor is shocked through its add-factor (the equation is still re-solved)."""
+        if shock is None:
+            t = self.af_target(x)
+            if t:
+                return 'addfactor', t
+            if x in self.eqs and self.eqs[x].evaluable and self.kind(x) == 'A':
+                return 'addfactor', x
+        return 'series', x
+
+    def impact_addfactor(self, t):
+        nodes = self.descendants(t) | {t}
+        ev = [n for n in nodes if n in self.eqs and self.eqs[n].evaluable]
+        blocked = sorted(n for n in nodes if n not in self.eqs or not self.eqs[n].evaluable)
+        base = self.simulate(ev)
+        sim = self.simulate(ev, resid_b={t})
+        rng = range(self.ws, self.we + 1)
+        return {n: [sim[n][i] - base[n][i] for i in rng] for n in ev}, {'nodes': len(ev), 'blocked': blocked}
+
+    def influence(self, x, shock=None, thr=0.01):
+        """Change X (to its scenario-B path, or by a shock), re-solve everything downstream, and
+        summarise how many variables move and by how much (% of their scenario-A level)."""
+        mode, tgt = self.shock_mode(x, shock)
+        if mode == 'addfactor':
+            eff, info = self.impact_addfactor(tgt)
+        else:
+            eff, info = self.impact(x, None, shock)
+        rng = list(range(self.ws, self.we + 1))
+        rows = []
+        for n, e in eff.items():
+            if n == x and mode != 'addfactor':
+                continue
+            a = self.series(n, 'a')
+            mx, mxp, tm = 0.0, 0.0, None
+            for i, t in enumerate(rng):
+                v = e[i]
+                if v != v or a[t] != a[t]:
+                    continue
+                p = abs(v) / abs(a[t]) * 100 if a[t] else (0.0 if v == 0 else float('inf'))
+                if p > mxp:
+                    mx, mxp, tm = v, p, t
+            if tm is not None:
+                rows.append((n, mx, mxp if mxp != float('inf') else None, tm, e[-1]))
+        moved = [r for r in rows if r[2] is None or r[2] >= thr]
+        b1 = sum(1 for r in moved if r[2] is None or r[2] >= 1)
+        b2 = sum(1 for r in moved if r[2] is not None and 0.1 <= r[2] < 1)
+        b3 = len(moved) - b1 - b2
+        moved.sort(key=lambda r: -(r[2] if r[2] is not None else 1e18))
+        reach = len(self.descendants(tgt)) + 1 if mode == 'addfactor' else len(self.descendants(x))
+        return {'x': x, 'mode': mode, 'target': tgt, 'reach': reach, 'resolved': info['nodes'], 'blocked': len(info['blocked']),
+                'moved': len(moved), 'ge1': b1, 'b01': b2, 'b001': b3, 'thr': thr,
+                'top': [(n, mx, p, self.labels[t]) for n, mx, p, t, _ in moved[:40]]}
+
     # ---- ranking helpers
     def ranked(self):
         return sorted(self.differs, key=lambda n: -self.stats[n]['score'])
@@ -1610,6 +1806,18 @@ class Model:
     def entry_points(self):
         out = [n for n in self.differs if self.kind(n) in ('X', 'A', 'F')]
         return sorted(out, key=lambda n: (self.stats[n]['first'], -self.stats[n]['score']))
+
+    def shock_list(self):
+        """Scenario shocks, one row each: an add-factor series and the variable it adjusts count once."""
+        out, seen = [], set()
+        for n in self.entry_points():
+            t = self.af_target(n) if self.kind(n) == 'F' else None
+            key = t or n
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(n)
+        return out
 
     def downstream(self, x, depth=4):
         dist, prev = {x: 0}, {}
@@ -1753,6 +1961,10 @@ def cmd_info(M, args, eqstats=None, fails=None):
     print('Series that differ: %d' % len(M.differs))
     if eqstats:
         print('Equations: %s' % ', '.join('%s=%d' % kv for kv in sorted(eqstats.items())))
+        if M.exog or M.exog_missing:
+            print('Set exogenously by the team (--exog): %d with an equation, treated as assumptions%s' % (
+                len(M.exog), ('; %d listed names have no equation: %s' % (len(M.exog_missing), ', '.join(M.exog_missing[:8])))
+                if M.exog_missing else ''))
         print('Add-factor series found: %d (suffix %s), e.g. %s' % (
             len(M.af_series), ','.join(M.af_suffixes), ', '.join(sorted(M.af_series)[:5])))
         bad = Counter(e.why for e in M.eqs.values() if not e.evaluable)
@@ -1889,7 +2101,11 @@ def print_contrib(M, n, prefix='', at=None):
     d = M.dyn(n, periods=True)
     eq = M.eqs.get(n)
     if eq is None:
-        print(prefix + '(no equation: an assumption set by the scenario)')
+        if n in M.exog:
+            print(prefix + '(set exogenously by the team: its equation is switched off, so its whole gap is a '
+                           'scenario choice. Equation: %s)' % M.exog[n].text[:200])
+        else:
+            print(prefix + '(no equation: an assumption set by the scenario)')
         return None
     if not d or 'error' in d:
         print(prefix + '(cannot evaluate: %s)' % (d['error'] if d else eq.why))
@@ -1926,7 +2142,7 @@ def cmd_explain(M, args):
     def head(n, prefix):
         s = M.stats.get(n)
         info = ('gap at end %s (%s)' % (fmt(s['dend']), fpct(s['pend']))) if s and s['differs'] else 'no difference'
-        print('%s%s  %s  [%s]' % (prefix, n, info, KIND_TEXT.get(M.kind(n), '')))
+        print('%s%s  %s  [%s]' % (prefix, n, info, 'set exogenously by the team' if n in M.exog else KIND_TEXT.get(M.kind(n), '')))
 
     def rec(n, depth, prefix):
         d = print_contrib(M, n, prefix + '    ', at)
@@ -2058,6 +2274,45 @@ def cmd_impact(M, args):
         print('%-24s %12s %9s %8s' % (n, fmt(v), fpct(p), fsh(s) if s is not None else ''))
 
 
+def cmd_influence(M, args):
+    shock = parse_shock(args.shock)
+    reach = M.reach_counts()
+    if args.x:
+        x = _norm(M, args.x)
+        r = M.influence(x, shock, args.thr)
+        what = 'its change from A to B' if shock is None else ('%s%s' % (args.shock, '' if args.shock.endswith('%') else ' unit(s)'))
+        if r['mode'] == 'addfactor':
+            what = 'its add-factor change from A to B (equation of %s re-solved)' % r['target']
+        if r['mode'] == 'addfactor':
+            print('%s: add-factor of %s; linked to %d variables in total (including %s).' % (
+                x, r['target'], r['reach'], r['target']))
+        else:
+            print('%s: used directly by %d equations; linked to %d variables in total.' % (
+                x, len(M.children.get(x, [])), reach.get(x, 0)))
+        print('Changing %s by %s, re-solving %d equations:' % (x, what, r['resolved']))
+        print('  %d variables move by >= %g%% of their level at some point: %d by >= 1%%, %d by 0.1-1%%, %d by %g-0.1%%'
+              % (r['moved'], args.thr, r['ge1'], r['b01'], r['b001'], args.thr))
+        if r['blocked']:
+            print('  (%d linked variables have no evaluable equation and were held fixed)' % r['blocked'])
+        print('\n%-26s %12s %9s  %s' % ('variable', 'largest effect', '%', 'when'))
+        for n, v, p, lab in r['top'][:args.n]:
+            print('%-26s %12s %9s  %s' % (n, fmt(v), fpct(math.copysign(p, v)) if p is not None else 'n/a', lab))
+        return
+    shocks = M.shock_list()[:args.n]
+    print('Influence of each scenario shock (its own A->B change only), largest effect over %s..%s:\n'
+          % (M.labels[M.ws], M.labels[M.we]))
+    print('%-24s %4s %8s %8s %6s %7s %8s  %s' % ('shock', 'type', 'linked', 'moved', '>=1%', '0.1-1%', '<0.1%', 'most affected'))
+    for x in shocks:
+        try:
+            r = M.influence(x, None, args.thr)
+        except EvalError as e:
+            print('%-24s  (%s)' % (x, e))
+            continue
+        top = ', '.join('%s %s' % (n, fpct(math.copysign(p, v)) if p is not None else '') for n, v, p, _ in r['top'][:3])
+        lab = x + (' (add-factor)' if r['mode'] == 'addfactor' and M.kind(x) != 'F' else '')
+        print('%-24s %4s %8d %8d %6d %7d %8d  %s' % (lab, M.kind(x), r['reach'], r['moved'], r['ge1'], r['b01'], r['b001'], top))
+
+
 def cmd_attribute(M, args):
     y = _norm(M, args.y)
     res, joint, gap = M.attribute(y)
@@ -2071,7 +2326,8 @@ def cmd_attribute(M, args):
             continue
         lab = s if kind == 'data' else 'add-factor of %s%s' % (s, (' (%s)' % M.af[s]) if s in M.af else '')
         print('  %s %-12s %s  [%s]' % (fsh(e[i] / g if abs(g) > 1e-12 else None), fmt(e[i]), lab,
-                                       KIND_TEXT.get(M.kind(s), '') if kind == 'data' else 'equation residual'))
+                                       ('set exogenously by the team' if s in M.exog else KIND_TEXT.get(M.kind(s), ''))
+                                       if kind == 'data' else 'equation residual'))
         shown += 1
         if shown >= args.n:
             break
@@ -2118,9 +2374,9 @@ def _af_rows(M):
         st = M.stats.get(afn) if afn else None
         if st and st['differs']:
             afc = [_r(st['dmax']), M.labels[st['tmax']]]
-        rows.append([n, M.desc.get(n, ''), _r(d['gap_end']), _r(M.stats[n]['pend'], 4),
-                     _r(d['formula_share_end'], 3), _r(d['af_share_end'], 3) if d['af_changed'] else 0,
-                     afn or '', afc, _r(d['af_share'], 3)])
+        rows.append([n, M.desc.get(n, ''), afn or '', afc, _r(d['af_share'], 3),
+                     [_r(v, 5) for v in d['pgap']], [_r(v, 5) for v in d['pf']],
+                     [_r(v, 5) for v in d['paf']] if d['paf'] else None])
     return rows
 
 
@@ -2153,7 +2409,7 @@ def build_data(M, args, eqstats, serve=False):
         s = M.stats[n]
         rows.append([n, M.desc.get(n, ''), M.geo(n), _r(s['score'], 4), _r(s['dmax']), _r(s['pmax'], 4),
                      _r(s['dend']), _r(s['pend'], 4), labels[s['first']] if s['first'] is not None else '',
-                     M.kind(n)])
+                     M.kind(n), M.change_class(n)])
     entry = [[n, M.kind(n)] for n in M.entry_points()]
 
     emb, seen = [], set()
@@ -2188,34 +2444,59 @@ def build_data(M, args, eqstats, serve=False):
         esh[str(nidx[n])] = [[nidx[k], _r(v, 3)] for k, v in d['shares'].items() if k in nidx and v is not None]
         if d['af_changed'] and d['af_share_end'] is not None:
             afsh[str(nidx[n])] = _r(d['af_share_end'], 3)
+    reach = M.reach_counts() if M.has_eqs else {}
+    infl = {}
+    if M.has_eqs and args.influence_n > 0:
+        t1 = time.time()
+        for x in M.shock_list()[:args.influence_n]:
+            try:
+                r = M.influence(x, None)
+            except EvalError:
+                continue
+            r['top'] = [[n, _r(v), _r(p, 4), lab] for n, v, p, lab in r['top']]
+            infl[x] = r
+        log('  influence of %d scenario shocks in %.1fs' % (len(infl), time.time() - t1))
     eqt = {n: M.eqs[n].text[:700] for n in nodes if n in M.eqs and (n in seen or n in M.differs)}
-    why = {n: M.eqs[n].why for n in eqt if M.eqs[n].why}
+    for n, e in M.exog.items():
+        eqt[n] = e.text[:700]
+    why = {n: M.eqs[n].why for n in eqt if n in M.eqs and M.eqs[n].why}
 
     geo_rows, stem_rows = [], []
     with_sep = sum(1 for n in M.common if M.geo(n))
     if with_sep >= 0.3 * max(1, len(M.common)):
-        g_all, g_diff = Counter(), defaultdict(list)
-        s_all, s_diff = defaultdict(set), defaultdict(list)
+        def grp_ok(n):  # add-factor series are counted through the variable they adjust
+            return not (M.has_eqs and M.kind(n) == 'F')
+        g_all, s_all = Counter(), defaultdict(set)
+        g_cls, s_cls = defaultdict(lambda: defaultdict(list)), defaultdict(lambda: defaultdict(list))
         for n in M.common:
+            if not grp_ok(n):
+                continue
             g_all[M.geo(n)] += 1
             s_all[M.stem(n)].add(M.geo(n))
         for n in M.differs:
-            g_diff[M.geo(n)].append(n)
-            s_diff[M.stem(n)].append(n)
+            if not grp_ok(n):
+                continue
+            c = M.change_class(n) or 'D'
+            g_cls[M.geo(n)][c].append(n)
+            s_cls[M.stem(n)][c].append(n)
 
         def med(xs):
             xs = sorted(xs)
             return xs[len(xs) // 2] if xs else None
-        for g, ns in g_diff.items():
-            ns.sort(key=lambda n: -M.stats[n]['score'])
-            geo_rows.append([g, len(ns), g_all[g], _r(med([M.stats[n]['score'] for n in ns]), 3), ns[:5]])
-        geo_rows.sort(key=lambda r: (-r[1], -(r[3] or 0)))
-        for st, ns in s_diff.items():
-            ns.sort(key=lambda n: -M.stats[n]['score'])
-            pm = [abs(M.stats[n]['pend']) for n in ns if M.stats[n]['pend'] == M.stats[n]['pend']]
-            stem_rows.append([st, len(ns), len(s_all[st]), _r(med(pm), 3), _r(M.stats[ns[0]]['score'], 3), ns[:5],
-                              M.desc.get(ns[0], '')])
-        stem_rows.sort(key=lambda r: (-r[1], -(r[4] or 0)))
+
+        def top(cl):
+            ns = cl['D'] or cl['U'] or cl['M']
+            return sorted(ns, key=lambda n: -M.stats[n]['score'])[:5]
+        for g, cl in g_cls.items():
+            geo_rows.append([g, len(cl['D']), len(cl['M']), len(cl['U']), g_all[g],
+                             _r(med([M.stats[n]['score'] for n in cl['D']]), 3), top(cl)])
+        geo_rows.sort(key=lambda r: (-r[1], -r[2]))
+        for st, cl in s_cls.items():
+            pm = [abs(M.stats[n]['pend']) for n in cl['D'] if M.stats[n]['pend'] == M.stats[n]['pend']]
+            tp = top(cl)
+            stem_rows.append([st, len(cl['D']), len(cl['M']), len(cl['U']), len(s_all[st]), _r(med(pm), 3),
+                              _r(max([M.stats[n]['score'] for n in cl['D']] or [0]), 3), tp, M.desc.get(tp[0], '')])
+        stem_rows.sort(key=lambda r: (-r[1], -r[2]))
 
     data = {
         'meta': {'a': M.A.label, 'b': M.B.label, 'ws': labels[M.ws], 'we': labels[M.we],
@@ -2225,10 +2506,13 @@ def build_data(M, args, eqstats, serve=False):
                  'eqs': dict(eqstats) if eqstats else None, 'has_eqs': M.has_eqs,
                  'generated': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
                  'adj_thr': M.adj_threshold, 'embedded': len(emb), 'serve': serve,
-                 'af_suffix': ','.join(M.af_suffixes), 'n_af': len(M.af_series)},
+                 'af_suffix': ','.join(M.af_suffixes), 'n_af': len(M.af_series), 'geo_sep': M.geo_sep,
+                 'exog': sorted(M.exog)},
         'per': per, 'wsi': M.ws - es,
         'rows': rows, 'entry': entry, 'nodes': nodes, 'par': par,
-        'vals': vals, 'dec': dec, 'esh': esh, 'afsh': afsh, 'eqt': eqt, 'why': why,
+        'vals': vals, 'dec': dec, 'esh': esh, 'afsh': afsh,
+        'reach': [reach.get(n, 0) for n in nodes], 'infl': infl,
+        'summary': build_summary(M, args, log) if M.has_eqs and getattr(args, 'summary_n', 8) > 0 else None, 'eqt': eqt, 'why': why,
         'afmap': {k: v for k, v in M.af.items()},
         'afrows': _af_rows(M) if M.has_eqs else [],
         'geo': geo_rows, 'stem': stem_rows,
@@ -2237,6 +2521,216 @@ def build_data(M, args, eqstats, serve=False):
     }
     log('  report data built in %.1fs (%d series with full detail)' % (time.time() - t0, len(emb)))
     return data, es
+
+
+def _pct_word(p):
+    if p is None or p != p:
+        return 'n/a'
+    return '%+.2f%%' % p
+
+
+def pick_key_vars(M, user=None, n=8):
+    """Key variables = the hubs that carry the scenario: changed variables with an equation that the
+    largest number of other variables depend on (one per concept), plus any the user names."""
+    out = []
+    for u in user or ():
+        u = u.upper()
+        if u in M.a or u in M.b:
+            out.append(u)
+    reach = M.reach_counts()
+    cands = [v for v in M.differs if v in M.eqs and M.eqs[v].evaluable and v not in M.af_series]
+    cands.sort(key=lambda v: (-reach.get(v, 0), -M.stats[v]['score']))
+    stems = {M.stem(v) for v in out}
+    for v in cands:
+        if len(out) >= n + len(user or ()):
+            break
+        if M.stem(v) in stems or v in out:
+            continue
+        stems.add(M.stem(v))
+        out.append(v)
+    return out
+
+
+def build_summary(M, args, log=lambda m: None):
+    t0 = time.time()
+    rng = list(range(M.ws, M.we + 1))
+    per = [M.labels[t] for t in rng]
+    keys = pick_key_vars(M, getattr(args, 'key_list', None), getattr(args, 'summary_n', 8))
+
+    def sid(kind, sname):
+        return sname if kind == 'data' else 'AF:' + sname
+
+    # 1. attribution of each key variable's gap to the scenario shocks, every quarter
+    attr = {}
+    for y in keys:
+        if y not in M.eqs or not M.eqs[y].evaluable:
+            continue
+        try:
+            res, joint, gap = M.attribute(y)
+        except (EvalError, ValueError, ZeroDivisionError, OverflowError):
+            continue
+        attr[y] = {'gap': [_r(v) for v in gap],
+                   'rows': [[sid(k, sn), [_r(v, 5) for v in e]] for k, sn, e in res
+                            if max([abs(v) for v in e if v == v] + [0]) > 1e-6 * max([abs(g) for g in gap if g == g] + [1e-30])]}
+    log('  summary: attribution of %d key variables in %.1fs' % (len(attr), time.time() - t0))
+
+    # 2. scenario shocks, ranked by how much of the key variables they explain
+    weight = defaultdict(float)
+    for y, a in attr.items():   # share of the key variable's movement over the whole window
+        den = sum(abs(v) for v in a['gap'] if v is not None)
+        for sname, e in a['rows']:
+            if den:
+                weight[sname] += min(1.5, sum(abs(v) for v in e if v is not None) / den)
+    shocks = []
+    for n in M.shock_list():
+        k = M.kind(n)
+        t = M.af_target(n) if k == 'F' else None
+        if t is None and k == 'A':
+            t = n
+        node = 'AF:' + t if t else n
+        st = M.stats[n]
+        shocks.append({'id': node, 'series': n, 'target': t, 'kind': k, 'desc': M.desc.get(t or n, ''),
+                       'first': M.labels[st['first']] if st['first'] is not None else '',
+                       'dmax': _r(st['dmax']), 'pmax': _r(st['pmax'], 4), 'tmax': M.labels[st['tmax']],
+                       'pend': _r(st['pend'], 4), 'dend': _r(st['dend']), 'w': round(weight.get(node, 0.0), 4)})
+    known = {x['id'] for x in shocks}
+    for sname in weight:  # sources that appear in attribution but not in the shock list (e.g. not-evaluable data)
+        if sname not in known:
+            base = sname[3:] if sname.startswith('AF:') else sname
+            st = M.stats.get(base)
+            shocks.append({'id': sname, 'series': base, 'target': base if sname.startswith('AF:') else None,
+                           'kind': M.kind(base), 'desc': M.desc.get(base, ''),
+                           'first': M.labels[st['first']] if st and st['first'] is not None else '',
+                           'dmax': _r(st['dmax']) if st else None, 'pmax': _r(st['pmax'], 4) if st else None,
+                           'tmax': M.labels[st['tmax']] if st else '', 'pend': _r(st['pend'], 4) if st else None,
+                           'dend': _r(st['dend']) if st else None, 'w': round(weight[sname], 4)})
+    shocks.sort(key=lambda x: (-x['w'], x['first']))
+
+    # 3. transmission map: shocks + key variables, linked through the equations
+    mshocks = [x for x in shocks if x['w'] >= 0.02][:10] or shocks[:6]
+    nodes = [x['id'] for x in mshocks] + [k for k in keys if k not in [x['id'] for x in mshocks]]
+    inset = set(k for k in keys)
+    edges = {}
+
+    def per_share(child, parent):
+        d = M.dyn(child, periods=True)
+        if not d or 'error' in d or parent not in d.get('contrib', {}):
+            return None
+        return [(c / g) if (g == g and c == c and abs(g) > 1e-12 * max(1.0, abs(M.series(child, 'a')[t])))
+                else None for c, g, t in zip(d['contrib'][parent], d['gap'], rng)]
+
+    def af_share(child):
+        d = M.dyn(child, periods=True)
+        if not d or 'error' in d or not d.get('af'):
+            return None
+        return [(c / g) if (g == g and c == c and abs(g) > 1e-12) else None for c, g in zip(d['af'], d['gap'])]
+
+    def chain(path):
+        out = None
+        for a, b in zip(path, path[1:]):
+            sh = per_share(b, a)
+            if sh is None:
+                return None
+            out = sh if out is None else [(x * y) if (x is not None and y is not None) else None for x, y in zip(out, sh)]
+        return out
+
+    for src in nodes:
+        if src.startswith('AF:'):
+            tgt = src[3:]
+            if tgt in inset:
+                edges[(src, tgt)] = (1, af_share(tgt))
+            start = tgt
+            if tgt not in inset:   # add-factor on a non-key variable: continue from it
+                pass
+            else:
+                continue
+        else:
+            start = src
+        # BFS from start, stopping at key variables
+        prev, q, seen = {start: None}, deque([start]), {start}
+        while q:
+            u = q.popleft()
+            for v in M.children.get(u, ()):
+                if v in seen or v not in M.differs_any:
+                    continue
+                seen.add(v)
+                prev[v] = u
+                if v in inset and v != src:
+                    path = [v]
+                    while path[-1] != start:
+                        path.append(prev[path[-1]])
+                    path = path[::-1]
+                    if src.startswith('AF:'):
+                        sh = chain(path)
+                        a0 = af_share(start)
+                        sh = [(x * y) if (x is not None and y is not None) else None for x, y in zip(a0, sh)] \
+                            if (sh is not None and a0 is not None) else None
+                    else:
+                        sh = chain(path)
+                    edges[(src, v)] = (len(path) - 1 + (1 if src.startswith('AF:') else 0), sh)
+                    continue
+                q.append(v)
+    nodemeta = {}
+    for nid in nodes:
+        base = nid[3:] if nid.startswith('AF:') else nid
+        a, b = M.series(base, 'a'), M.series(base, 'b')
+        gp = []
+        for t in rng:
+            x, y = a[t] if a else NAN, b[t] if b else NAN
+            gp.append(_r((y - x) / abs(x) * 100, 4) if (x == x and y == y and x) else None)
+        nodemeta[nid] = {'label': ('add-factor of ' + base) if nid.startswith('AF:') else base,
+                         'desc': M.desc.get(base, ''), 'shock': nid in [x['id'] for x in mshocks],
+                         'pgap': gp, 'kind': M.kind(base)}
+    mp = {'nodes': [dict(id=n, **nodemeta[n]) for n in nodes],
+          'edges': [[a, b, steps, [_r(v, 3) for v in sh] if sh else None] for (a, b), (steps, sh) in edges.items()]}
+
+    # 4. written summary
+    cc = Counter(M.change_class(n) for n in M.differs)
+    first = min((M.stats[n]['first'] for n in M.differs if M.stats[n]['first'] is not None), default=None)
+    lines = []
+    lines.append('B (%s) starts to differ from A (%s) in %s. %d series differ: %d were changed directly by the '
+                 'scenario (assumptions or add-factors) and %d moved only because the model\'s equations passed '
+                 'those changes on.' % (M.B.label, M.A.label, M.labels[first] if first is not None else '?',
+                                        len(M.differs), cc.get('D', 0), cc.get('M', 0))
+                 if M.has_eqs else
+                 'B (%s) starts to differ from A (%s) in %s; %d series differ.' % (
+                     M.B.label, M.A.label, M.labels[first] if first is not None else '?', len(M.differs)))
+    sh_lines = []
+    for x in shocks[:6]:
+        nm = x['series'] if not x['id'].startswith('AF:') else 'add-factor on %s' % x['target']
+        dsc = (' (%s)' % x['desc']) if x['desc'] else ''
+        if x['id'].startswith('AF:') and x['series'] == x['target']:
+            mag = 'its equation\'s residual was changed'
+        else:
+            mag = 'largest change %s (%s) in %s, %s by %s' % (fmt(x['dmax']), _pct_word(x['pmax']), x['tmax'],
+                                                           _pct_word(x['pend']), M.labels[M.we])
+        sh_lines.append('%s%s: from %s; %s.' % (nm, dsc, x['first'], mag))
+    key_lines = []
+    lab = {x['id']: (x['series'] if not x['id'].startswith('AF:') else 'add-factor on ' + x['target']) for x in shocks}
+    for y in keys:
+        st = M.stats.get(y)
+        if not st:
+            continue
+        txt = '%s%s: %s vs A at %s (largest %s in %s).' % (
+            y, (' (%s)' % M.desc[y]) if M.desc.get(y) else '', _pct_word(st['pend']), M.labels[st['tend']],
+            _pct_word(st['pmax']), M.labels[st['tmax']])
+        a = attr.get(y)
+        if a:
+            g = a['gap']
+            i = max(j for j, v in enumerate(g) if v is not None)
+            parts = sorted(((r[1][i] or 0) / g[i], r[0]) for r in a['rows'] if g[i]) if g[i] else []
+            parts = sorted(parts, key=lambda z: -abs(z[0]))[:3]
+            if parts:
+                txt += ' Its gap comes from ' + ', '.join('%s %.0f%%' % (lab.get(sn, sn), 100 * v) for v, sn in parts) + '.'
+        key_lines.append(txt)
+    spread = []
+    if M.has_eqs:
+        sc = Counter(M.stem(n) for n in M.differs if M.change_class(n) == 'D' and M.kind(n) != 'F')
+        if sc:
+            spread.append('Directly changed concepts: ' + ', '.join('%s (%d)' % kv for kv in sc.most_common(6)) + '.')
+    log('  summary built in %.1fs' % (time.time() - t0))
+    return {'per': per, 'keys': keys, 'attr': attr, 'shocks': shocks[:30], 'map': mp,
+            'text': {'intro': lines, 'shocks': sh_lines, 'keys': key_lines, 'spread': spread}}
 
 
 def render_html(M, data):
@@ -2270,12 +2764,13 @@ def _impact_payload(M, x, y, shock_s):
     for n, e in eff.items():
         if n == x or n == y:
             continue
-        a = M.series(n, 'a')[M.we]
-        v = e[-1]
-        if v == v and a:
-            top.append((abs(v / a), n, v, v / abs(a) * 100))
-    top.sort(reverse=True)
-    out['top'] = [[n, _r(v), _r(p, 4)] for _, n, v, p in top[:40]]
+        a = M.series(n, 'a')
+        pc = [(v / abs(a[t]) * 100) if (v == v and a[t] == a[t] and a[t]) else None for v, t in zip(e, rng)]
+        m = max([abs(p) for p in pc if p is not None] + [0])
+        if m > 0:
+            top.append((m, n, e, pc))
+    top.sort(key=lambda z: -z[0])
+    out['top'] = [[n, [_r(v) for v in e], [_r(p, 4) for p in pc]] for _, n, e, pc in top[:60]]
     return out
 
 
@@ -2316,11 +2811,15 @@ def cmd_serve(M, args, eqstats):
                 if u.path == '/api/detail':
                     n = _norm(M, q['n'])
                     out = {'n': n, 'vals': _vals_payload(M, n, es), 'dec': _dec_payload(M, n),
-                           'eqt': M.eqs[n].text[:700] if n in M.eqs else None,
+                           'eqt': M.eqs[n].text[:700] if n in M.eqs else (M.exog[n].text[:700] if n in M.exog else None),
                            'why': M.eqs[n].why if n in M.eqs else None, 'desc': M.desc.get(n, '')}
                 elif u.path == '/api/impact':
                     out = _impact_payload(M, _norm(M, q['x']), _norm(M, q['y']) if q.get('y') else None,
                                           q.get('shock'))
+                elif u.path == '/api/influence':
+                    r = M.influence(_norm(M, q['x']), parse_shock(q.get('shock')))
+                    r['top'] = [[n, _r(v), _r(p, 4), lab] for n, v, p, lab in r['top']]
+                    out = r
                 elif u.path == '/api/attr':
                     out = _attr_payload(M, _norm(M, q['y']))
                 else:
@@ -2407,10 +2906,12 @@ svg text{fill:var(--mut);font-size:11px}
 </header>
 <nav id="tabs"></nav>
 <div class="wrap">
-<section id="t-sum"></section>
+<section id="t-story"></section>
+<section id="t-sum" class="hide"></section>
 <section id="t-top" class="hide"></section>
 <section id="t-entry" class="hide"></section>
 <section id="t-afx" class="hide"></section>
+<section id="t-inf" class="hide"></section>
 <section id="t-stem" class="hide"></section>
 <section id="t-geo" class="hide"></section>
 <section id="t-path" class="hide"></section>
@@ -2426,29 +2927,75 @@ const ROW={}; D.rows.forEach(r=>ROW[r[0]]=r);
 const KT={X:'assumption',F:'add-factor',A:'mostly add-factor',E:'formula',N:'not evaluable','-':''};
 const KL={X:'Exogenous: no equation, set directly by the scenario',F:'An add-factor series (name ends in '+D.meta.af_suffix+')',A:'Has an equation, but most of its change comes from its add-factor / residual, not from its drivers',E:'Change is explained by its equation (formula) drivers',N:'Has an equation that could not be evaluated'};
 const SERVE=D.meta.serve&&location.protocol.startsWith('http');
+const EXOG=new Set(D.meta.exog||[]);
 const $=(s,e=document)=>e.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function fmt(v){if(v==null||isNaN(v))return'–';if(v===0)return'0';const a=Math.abs(v);if(a>=1e4)return v.toLocaleString(undefined,{maximumFractionDigits:0});return Number(v.toPrecision(4)).toString()}
+function fmt(v){if(v==null||isNaN(v))return'–';if(v===0||Math.abs(v)<1e-9)return'0';const a=Math.abs(v);if(a>=1e4)return v.toLocaleString(undefined,{maximumFractionDigits:0});return Number(v.toPrecision(4)).toString()}
 function pct(v){if(v==null||isNaN(v))return'–';return(v>0?'+':'')+v.toFixed(2)+'%'}
 function cls(v){return v>0?'pos':v<0?'neg':''}
-function badge(k){return k&&k!=='-'?`<span class="badge b${k}" title="${esc(KL[k]||'')}">${KT[k]}</span>`:''}
+function badge(k,n){if(n&&EXOG.has(n))return `<span class="badge bX" title="Has an equation, but the team set it exogenously (--exog)">set by team</span>`;return k&&k!=='-'?`<span class="badge b${k}" title="${esc(KL[k]||'')}">${KT[k]}</span>`:''}
 function vlink(n){return `<a class="v" data-v="${esc(n)}">${esc(n)}</a>`}
 function desc(n){const r=ROW[n];return r?r[1]:(D.desc[n]||'')}
 document.addEventListener('click',e=>{const a=e.target.closest('[data-v]');if(a){e.preventDefault();show(a.dataset.v)}});
 
 // ---------- tabs
-const TABS=[['sum','Overview'],['top','Key changes'],['entry','Where B starts'],['afx','Formula vs add-factor'],['stem','By concept'],['geo','By geography'],['path','Impact X → Y']];
-$('#tabs').innerHTML=TABS.filter(t=>t[0]==='afx'?D.afrows.length:(t[0]!=='stem'&&t[0]!=='geo')||D[t[0]].length).map(t=>`<button data-t="${t[0]}">${t[1]}</button>`).join('');
+const TABS=[['story','Summary'],['sum','Overview'],['top','Key changes'],['entry','Where B starts'],['afx','Formula vs add-factor'],['stem','By concept'],['geo','By geography'],['inf','Influence'],['path','Impact X → Y']];
+$('#tabs').innerHTML=TABS.filter(t=>t[0]==='story'?D.summary:t[0]==='afx'?D.afrows.length:t[0]==='inf'?M.has_eqs:(t[0]!=='stem'&&t[0]!=='geo')||D[t[0]].length).map(t=>`<button data-t="${t[0]}">${t[1]}</button>`).join('');
 function tab(t){document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));TABS.forEach(x=>$('#t-'+x[0]).classList.toggle('hide',x[0]!==t))}
 $('#tabs').addEventListener('click',e=>{if(e.target.dataset.t)tab(e.target.dataset.t)});
 $('#sub').innerHTML=`<b>A</b> = ${esc(M.a)} &nbsp; vs &nbsp; <b>B</b> = ${esc(M.b)} &nbsp;·&nbsp; window ${M.ws}–${M.we} &nbsp;·&nbsp; generated ${M.generated}`;
 
+// ---------- summary + transmission map
+(function(){const S=D.summary;if(!S)return;
+ const NP=S.per.length,lab={};S.shocks.forEach(x=>lab[x.id]=x.id.startsWith('AF:')?'add-factor on '+x.target:x.series);
+ const nm=id=>lab[id]||(id.startsWith('AF:')?'add-factor on '+id.slice(3):id);
+ const lnk=id=>id.startsWith('AF:')?`<i>add-factor on</i> ${vlink(id.slice(3))}`:vlink(id);
+ let h=`<div class="card">${S.text.intro.map(esc).join(' ')} ${S.text.spread.map(esc).join(' ')}</div>
+ <h2>What the scenario changed</h2><div class="hint">The shocks B is built on, ordered by how much of the key variables they explain.</div>
+ <div class="tw"><table><thead><tr><th>Shock</th><th>Description</th><th>From</th><th class="n">Largest change</th><th class="n">At ${esc(M.we)}</th><th class="n" title="Sum over key variables of the share of their movement (whole window) that this shock explains">Weight in key variables</th></tr></thead><tbody>${S.shocks.slice(0,15).map(x=>`<tr><td>${x.id.startsWith('AF:')&&x.series!==x.target?`${vlink(x.series)} <span class="small mut">→ ${esc(x.target)}</span>`:x.id.startsWith('AF:')?`<i>add-factor on</i> ${vlink(x.target)}`:vlink(x.series)}</td><td class="small">${esc(x.desc).slice(0,60)}</td><td>${esc(x.first)}</td><td class="n ${cls(x.dmax)}">${fmt(x.dmax)} <span class="small">(${pct(x.pmax)}, ${esc(x.tmax)})</span></td><td class="n ${cls(x.pend)}">${pct(x.pend)}</td><td class="n">${x.w?x.w.toFixed(2):'–'}</td></tr>`).join('')}</tbody></table></div>
+ <h2>Key variables and where their gaps come from</h2><div class="hint">Key variables are picked automatically as the changed variables that the most other variables depend on (one per concept). Use <code>--key</code> to choose your own. Each share re-solves every equation upstream with only that shock switched from A to B.</div>
+ <div class="ctl" style="align-items:center"><span class="small mut">Quarter</span><input type="range" id="ssl" min="0" max="${NP-1}" value="${NP-1}" style="flex:1;min-width:200px"><b id="slab"></b></div>
+ <div id="smap"></div><div id="skeys"></div>
+ <h2>In words</h2><ul>${S.text.shocks.length?'<li><b>Shocks:</b><ul>'+S.text.shocks.map(t=>`<li>${esc(t)}</li>`).join('')+'</ul></li>':''}${S.text.keys.length?'<li><b>Key variables:</b><ul>'+S.text.keys.map(t=>`<li>${esc(t)}</li>`).join('')+'</ul></li>':''}</ul>`;
+ $('#t-story').innerHTML=h;
+ const upd=()=>{const i=+$('#ssl').value;$('#slab').textContent=S.per[i];$('#smap').innerHTML=mapSVG(S,i,nm);
+  $('#skeys').innerHTML=`<div class="tw"><table><thead><tr><th>Key variable</th><th>Description</th><th class="n">Gap %</th><th>Main sources of the gap at ${esc(S.per[i])}</th></tr></thead><tbody>${S.keys.map(k=>{const a=S.attr[k],nd=S.map.nodes.find(n=>n.id===k),gp=nd?nd.pgap[i]:null;
+   let src='<span class="mut small">not evaluable</span>';if(a){const g=a.gap[i];src=g?a.rows.map(r=>[r[0],(r[1][i]||0)/g]).filter(r=>Math.abs(r[1])>=.005).sort((x,y)=>Math.abs(y[1])-Math.abs(x[1])).slice(0,4).map(r=>`${lnk(r[0])} <b>${Math.round(100*r[1])}%</b>`).join(' · ')||'<span class="mut small">none above 0.5%</span>':'<span class="mut small">no gap this quarter</span>'}
+   return `<tr><td>${vlink(k)}</td><td class="small">${esc(desc(k)).slice(0,50)}</td><td class="n ${cls(gp)}">${pct(gp)}</td><td class="small">${src}</td></tr>`}).join('')}</tbody></table></div>`};
+ $('#ssl').addEventListener('input',upd);upd();
+})();
+function mapSVG(S,i,nm){
+ const N=S.map.nodes,E=S.map.edges,id2=new Map(N.map((n,k)=>[n.id,k]));
+ // layers: shocks at 0, others = shortest number of map links from any shock
+ const L=new Array(N.length).fill(Infinity),q=[];N.forEach((n,k)=>{if(n.shock){L[k]=0;q.push(k)}});
+ const out=N.map(()=>[]);E.forEach(e=>{const a=id2.get(e[0]),b=id2.get(e[1]);if(a!=null&&b!=null)out[a].push(b)});
+ while(q.length){const u=q.shift();for(const v of out[u])if(L[v]>L[u]+1){L[v]=L[u]+1;q.push(v)}}
+ const mx=Math.max(0,...L.filter(isFinite));N.forEach((n,k)=>{if(!isFinite(L[k]))L[k]=mx+1});
+ const nl=Math.max(...L)+1,cols=[...Array(nl)].map(()=>[]);N.forEach((n,k)=>cols[L[k]].push(k));
+ const ins=N.map(()=>[]);E.forEach(e=>{const a=id2.get(e[0]),b=id2.get(e[1]);if(a!=null&&b!=null)ins[b].push(a)});
+ const pos=new Array(N.length);cols.forEach((c,ci)=>{if(ci>0)c.sort((x,y)=>{const m=z=>ins[z].length?ins[z].reduce((s,p)=>s+(pos[p]||0),0)/ins[z].length:99;return m(x)-m(y)});c.forEach((k,r)=>pos[k]=r)});
+ const W=1000,BW=150,BH=40,gapY=18,maxR=Math.max(...cols.map(c=>c.length)),H=Math.max(160,maxR*(BH+gapY)+30);
+ const cx=ci=>14+ci*((W-BW-28)/Math.max(1,nl-1)),cy=(ci,r)=>{const n=cols[ci].length,tot=n*BH+(n-1)*gapY;return (H-tot)/2+r*(BH+gapY)};
+ const P=N.map((n,k)=>({x:cx(L[k]),y:cy(L[k],pos[k])}));
+ const col=v=>{if(v==null)return'var(--card)';const a=Math.min(1,Math.abs(v)/3);return v<0?`rgba(217,45,32,${.12+.55*a})`:`rgba(15,157,88,${.12+.55*a})`};
+ let ed='';E.forEach(e=>{const a=id2.get(e[0]),b=id2.get(e[1]);if(a==null||b==null)return;const sh=e[3]?e[3][i]:null,w=sh==null?1:1+9*Math.min(1,Math.abs(sh));
+  const x1=P[a].x+BW,y1=P[a].y+BH/2,x2=P[b].x,y2=P[b].y+BH/2;let d,fwd=x2>x1+4,lx,ly;
+  if(fwd){const m=(x1+x2)/2;d=`M${x1},${y1} C${m},${y1} ${m},${y2} ${x2},${y2}`;lx=x2-18;ly=y2-5}
+  else if(Math.abs(P[a].x-P[b].x)<2){const xr=x1+34;d=`M${x1},${y1} C${xr},${y1} ${xr},${y2} ${x1},${y2}`;lx=xr-4;ly=(y1+y2)/2}
+  else{const yy=H+18;d=`M${P[a].x+BW/2},${P[a].y+BH} C${P[a].x+BW/2},${yy} ${P[b].x+BW/2},${yy} ${P[b].x+BW/2},${P[b].y+BH}`;lx=null}
+  ed+=`<path d="${d}" fill="none" stroke="${sh!=null&&sh<0?'var(--neg)':'var(--mut)'}" stroke-opacity="${fwd?(sh==null?.35:.35+.5*Math.min(1,Math.abs(sh))):.28}" stroke-width="${fwd?w:Math.min(w,4)}" ${e[2]>1||!fwd?'stroke-dasharray="6,4"':''}><title>${esc(nm(e[0]))} → ${esc(e[1])}: ${sh==null?'share n/a':Math.round(100*sh)+'% of its gap'}${e[2]>1?' (via '+(e[2]-1)+' other variable(s))':''}</title></path>`;
+  if(lx!=null&&sh!=null&&Math.abs(sh)>=.05)ed+=`<text x="${lx}" y="${ly}" text-anchor="end" style="font-size:10px;font-weight:600">${Math.round(100*sh)}%</text>`});
+ let nd=N.map((n,k)=>{const v=n.pgap[i],lb=n.id.startsWith('AF:')?'add-factor':n.id;return `<g class="mn" data-v="${esc(n.id.startsWith('AF:')?n.id.slice(3):n.id)}" style="cursor:pointer"><rect x="${P[k].x}" y="${P[k].y}" width="${BW}" height="${BH}" rx="8" fill="${col(v)}" stroke="${n.shock?'#c4320a':'var(--line)'}" stroke-width="${n.shock?2:1}"/><text x="${P[k].x+8}" y="${P[k].y+16}" style="font-size:12px;fill:var(--fg);font-weight:600">${esc(lb.length>22?lb.slice(0,21)+'…':lb)}</text><text x="${P[k].x+8}" y="${P[k].y+31}" style="font-size:11px">${n.id.startsWith('AF:')?esc(n.id.slice(3)):(v==null?'':pct(v))}${n.shock&&!n.id.startsWith('AF:')?' · shock':''}</text><title>${esc(n.label)}${n.desc?' — '+esc(n.desc):''}: ${pct(v)} vs A</title></g>`}).join('');
+ return `<div class="tw"><svg viewBox="0 0 ${W} ${H+30}" width="100%" style="min-width:700px">${ed}${nd}</svg></div><div class="small mut">Left: the scenario's shocks (red border). Moving right: key variables in the order the shocks reach them, coloured by their gap vs A (green above, red below). Solid lines are equation links; thickness and % = share of the receiving variable's gap that comes from that link. Dashed lines either pass through variables not shown or feed back to the left (model feedback loops). Hover for details; click a box to open it.</div>`}
+
 // ---------- overview
 (function(){
- const kinds={};D.rows.forEach(r=>kinds[r[9]]=(kinds[r[9]]||0)+1);
+ const kinds={},ccs={};D.rows.forEach(r=>{kinds[r[9]]=(kinds[r[9]]||0)+1;ccs[r[10]]=(ccs[r[10]]||0)+1});
  let h=`<div class="kpis"><div class="kpi"><span class="mut small">series in both</span><b>${M.n_common.toLocaleString()}</b></div>
  <div class="kpi"><span class="mut small">differ between A and B</span><b>${M.n_diff.toLocaleString()}</b></div>`;
- if(M.has_eqs){h+=`<div class="kpi"><span class="mut small">changed assumptions (no equation)</span><b>${(kinds.X||0).toLocaleString()}</b></div>
+ if(M.has_eqs){h+=`<div class="kpi"><span class="mut small">changed directly (assumption / add-factor)</span><b>${(ccs.D||0).toLocaleString()}</b></div>
+ <div class="kpi"><span class="mut small">moved only through their formula</span><b>${(ccs.M||0).toLocaleString()}</b></div>
+ <div class="kpi"><span class="mut small">changed assumptions (no equation)</span><b>${(kinds.X||0).toLocaleString()}</b></div>
  <div class="kpi"><span class="mut small">add-factor series changed</span><b>${(kinds.F||0).toLocaleString()}</b></div>
  <div class="kpi"><span class="mut small">variables driven mostly by add-factors</span><b>${(kinds.A||0).toLocaleString()}</b></div>`}
  h+=`</div><p class="mut small">Comparison window ${M.ws}–${M.we} (data ${M.first}–${M.last}). ${M.n_only_a?M.n_only_a+' series only in A. ':''}${M.n_only_b?M.n_only_b+' series only in B. ':''}</p>`;
@@ -2461,28 +3008,45 @@ $('#sub').innerHTML=`<b>A</b> = ${esc(M.a)} &nbsp; vs &nbsp; <b>B</b> = ${esc(M.
 })();
 
 function tableHTML(rows,sortHint){
- return `<div class="tw"><table><thead><tr><th>Series</th><th>Description</th><th class="n">Score</th><th class="n">Max gap</th><th class="n">Max gap %</th><th class="n">Gap at end %</th><th>Diverges</th><th>Type</th></tr></thead><tbody>${rows.map(r=>`<tr class="cl" data-v="${esc(r[0])}"><td><a class="v">${esc(r[0])}</a></td><td class="small">${esc(r[1]).slice(0,80)}</td><td class="n">${fmt(r[3])}</td><td class="n ${cls(r[4])}">${fmt(r[4])}</td><td class="n ${cls(r[5])}">${pct(r[5])}</td><td class="n ${cls(r[7])}">${pct(r[7])}</td><td>${esc(r[8])}</td><td>${badge(r[9])}</td></tr>`).join('')}</tbody></table></div>`}
+ return `<div class="tw"><table><thead><tr><th>Series</th><th>Description</th><th class="n">Score</th><th class="n">Max gap</th><th class="n">Max gap %</th><th class="n">Gap at end %</th><th>Diverges</th><th>Type</th></tr></thead><tbody>${rows.map(r=>`<tr class="cl" data-v="${esc(r[0])}"><td><a class="v">${esc(r[0])}</a></td><td class="small">${esc(r[1]).slice(0,80)}</td><td class="n">${fmt(r[3])}</td><td class="n ${cls(r[4])}">${fmt(r[4])}</td><td class="n ${cls(r[5])}">${pct(r[5])}</td><td class="n ${cls(r[7])}">${pct(r[7])}</td><td>${esc(r[8])}</td><td>${badge(r[9],r[0])}</td></tr>`).join('')}</tbody></table></div>`}
 
-// ---------- key changes (filterable)
+// ---------- key changes (filterable, complete list)
+const CC={D:'changed directly',M:'via formula only',U:'not evaluable','':''};
+const CCL={D:'Changed directly: an assumption, an add-factor series, or its equation\'s add-factor changed',M:'Same equation and same add-factor in both scenarios; it moved only because its inputs moved',U:'Its equation could not be evaluated, so this cannot be told'};
+function ccBadge(c){return c?`<span class="small ${c==='D'?'':'mut'}" title="${esc(CCL[c]||'')}">${CC[c]}</span>`:''}
+let KC={};
 (function(){
  const geos=[...new Set(D.rows.map(r=>r[2]).filter(Boolean))].sort();
- let h=`<div class="ctl"><input type="text" id="q" placeholder="Search name or description (regex ok)">
- ${geos.length>1?`<select id="g"><option value="">All geographies</option>${geos.map(g=>`<option>${esc(g)}</option>`).join('')}</select>`:''}
- ${M.has_eqs?`<select id="k"><option value="">All types</option><option value="X">Assumptions</option><option value="A">Adjusted equations</option><option value="E">Explained by equation</option><option value="N">Not evaluable</option></select>`:''}
- <select id="dir"><option value="">Up or down</option><option value="u">B above A</option><option value="d">B below A</option></select></div>
+ let h=`<div class="hint">Every series that differs between A and B. ${M.has_eqs?'<b>Changed directly</b> = an assumption or add-factor changed. <b>Via formula only</b> = same equation and same add-factor; it moved only because its inputs moved.':''}</div>
+ <div class="ctl"><input type="text" id="q" placeholder="Search name or description (regex ok)">
+ ${M.has_eqs?`<select id="cc"><option value="">All changed series</option><option value="D">Changed directly</option><option value="M">Moved via formula only</option><option value="U">Not evaluable</option></select>`:''}
+ ${geos.length>1?`<select id="g"><option value="">All geographies</option>${D.rows.some(r=>!r[2])?'<option value="__none__">(no geography)</option>':''}${geos.map(g=>`<option>${esc(g)}</option>`).join('')}</select>`:''}
+ ${M.has_eqs?`<select id="k"><option value="">All types</option><option value="X">Assumptions</option><option value="F">Add-factor series</option><option value="A">Mostly add-factor</option><option value="E">Formula</option><option value="N">Not evaluable</option></select>`:''}
+ <select id="dir"><option value="">Up or down</option><option value="u">B above A</option><option value="d">B below A</option></select>
+ <button class="btn" id="csv">Download CSV</button></div>
  <div id="cnt" class="hint"></div><div class="tw"><table id="tt"><thead><tr>
- <th data-c="0">Series</th><th data-c="1">Description</th><th data-c="3" class="n">Score ▾</th><th data-c="4" class="n">Max gap</th><th data-c="5" class="n">Max gap %</th><th data-c="7" class="n">Gap at end %</th><th data-c="8">Diverges</th><th data-c="9">Type</th></tr></thead><tbody></tbody></table></div>`;
+ <th data-c="0">Series</th><th data-c="1">Description</th><th data-c="3" class="n">Score ▾</th><th data-c="4" class="n">Max gap</th><th data-c="5" class="n">Max gap %</th><th data-c="7" class="n">Gap at end %</th><th data-c="8">Diverges</th><th data-c="9">Type</th>${M.has_eqs?'<th data-c="10">Change</th>':''}</tr></thead><tbody></tbody></table></div><div class="ctl" id="more"></div>`;
  $('#t-top').innerHTML=h;
- let sc=3,sd=-1;
- function render(){
+ let sc=3,sd=-1,lim=500,cur=[];
+ function filt(){
   const q=$('#q').value.trim();let rx=null;try{rx=q?new RegExp(q,'i'):null}catch(e){rx=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'i')}
-  const g=$('#g')?$('#g').value:'',k=$('#k')?$('#k').value:'',dr=$('#dir').value;
-  let rs=D.rows.filter(r=>(!rx||rx.test(r[0])||rx.test(r[1]))&&(!g||r[2]===g)&&(!k||r[9]===k)&&(!dr||(dr==='u'?r[4]>0:r[4]<0)));
+  const g=$('#g')?$('#g').value:'',k=$('#k')?$('#k').value:'',c=$('#cc')?$('#cc').value:'',dr=$('#dir').value;
+  let rs=D.rows.filter(r=>(!rx||rx.test(r[0])||rx.test(r[1]))&&(!g||(g==='__none__'?!r[2]:r[2]===g))&&(!k||r[9]===k)&&(!c||r[10]===c)&&(!dr||(dr==='u'?r[4]>0:r[4]<0)));
   rs.sort((x,y)=>{let a=x[sc],b=y[sc];if(typeof a==='number'||typeof b==='number'){a=a==null?-Infinity:Math.abs(a);b=b==null?-Infinity:Math.abs(b)}return a<b?-sd:a>b?sd:0});
-  $('#cnt').textContent=rs.length.toLocaleString()+' series'+(rs.length>400?' (showing first 400)':'')+' · numeric columns sort by size, ignoring sign';
-  $('#tt tbody').innerHTML=rs.slice(0,400).map(r=>`<tr class="cl" data-v="${esc(r[0])}"><td><a class="v">${esc(r[0])}</a></td><td class="small">${esc(r[1]).slice(0,80)}</td><td class="n">${fmt(r[3])}</td><td class="n ${cls(r[4])}">${fmt(r[4])}</td><td class="n ${cls(r[5])}">${pct(r[5])}</td><td class="n ${cls(r[7])}">${pct(r[7])}</td><td>${esc(r[8])}</td><td>${badge(r[9])}</td></tr>`).join('')}
- ['q','g','k','dir'].forEach(id=>{const e=$('#'+id);if(e)e.addEventListener('input',render)});
+  return rs}
+ function render(){
+  cur=filt();
+  $('#cnt').textContent=cur.length.toLocaleString()+' series'+(cur.length>lim?` (showing ${lim.toLocaleString()})`:'')+' · numeric columns sort by size, ignoring sign';
+  $('#tt tbody').innerHTML=cur.slice(0,lim).map(r=>`<tr class="cl" data-v="${esc(r[0])}"><td><a class="v">${esc(r[0])}</a></td><td class="small">${esc(r[1]).slice(0,80)}</td><td class="n">${fmt(r[3])}</td><td class="n ${cls(r[4])}">${fmt(r[4])}</td><td class="n ${cls(r[5])}">${pct(r[5])}</td><td class="n ${cls(r[7])}">${pct(r[7])}</td><td>${esc(r[8])}</td><td>${badge(r[9],r[0])}</td>${M.has_eqs?`<td>${ccBadge(r[10])}</td>`:''}</tr>`).join('');
+  $('#more').innerHTML=cur.length>lim?`<button class="btn" id="m1">Show ${Math.min(2000,cur.length-lim).toLocaleString()} more</button><button class="btn" id="m2">Show all ${cur.length.toLocaleString()}</button>`:'';
+  if(cur.length>lim){$('#m1').onclick=()=>{lim+=2000;render()};$('#m2').onclick=()=>{lim=cur.length;render()}}}
+ ['q','g','k','cc','dir'].forEach(id=>{const e=$('#'+id);if(e)e.addEventListener('input',()=>{lim=500;render()})});
  $('#tt thead').addEventListener('click',e=>{const c=e.target.dataset.c;if(c==null)return;const ci=+c;if(ci===sc)sd=-sd;else{sc=ci;sd=(ci<=2||ci>=8)?1:-1}document.querySelectorAll('#tt th').forEach(t=>t.textContent=t.textContent.replace(/ [▾▴]$/,''));e.target.textContent+=sd<0?' ▾':' ▴';render()});
+ $('#csv').onclick=()=>{const q=v=>{v=v==null?'':String(v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v};
+  const hdr=['series','description','geo','score','max_gap','max_gap_pct','end_gap','end_gap_pct','first_divergence','type','change'];
+  const lines=[hdr.join(',')].concat(cur.map(r=>[r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],KT[r[9]]||r[9],CC[r[10]]||''].map(q).join(',')));
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([lines.join('\n')],{type:'text/csv'}));a.download='changed_series.csv';document.body.appendChild(a);a.click();a.remove()};
+ KC={set:(o)=>{['q','g','k','cc','dir'].forEach(id=>{const e=$('#'+id);if(e)e.value=o[id]||''});lim=500;render();tab('top')}};
  render();
 })();
 
@@ -2494,22 +3058,57 @@ function tableHTML(rows,sortHint){
  $('#t-entry').innerHTML=h;
 })();
 
-// ---------- formula vs add-factor
+// ---------- formula vs add-factor (time slider)
 (function(){if(!D.afrows.length)return;
- $('#t-afx').innerHTML=`<div class="hint">For every variable with an equation: how much of its gap (B−A) at ${M.we} comes from its <b>formula</b> (its drivers changed) versus its <b>add-factor</b> (${esc(M.af_suffix)} series or residual changed). The equation is the same in both scenarios, so any gap the formula does not explain comes from the add-factor.</div>
- <div class="ctl"><input type="text" id="aq" placeholder="Search"><select id="am"><option value="">All</option><option value="af" selected>Add-factor changed</option><option value="maf">Mostly add-factor (≥50%)</option><option value="f">Formula only</option></select></div><div id="acnt" class="hint"></div>
- <div class="tw"><table><thead><tr><th>Series</th><th>Description</th><th class="n">Gap at end</th><th class="n">Gap %</th><th class="n">From formula</th><th class="n">From add-factor</th><th>Add-factor series (largest B−A change)</th></tr></thead><tbody id="atb"></tbody></table></div>`;
- const sh=v=>v==null?'–':Math.round(v*100)+'%';
- const r=()=>{const q=$('#aq').value.trim().toUpperCase(),m=$('#am').value;
-  const rs=D.afrows.filter(x=>(!q||x[0].includes(q)||x[1].toUpperCase().includes(q))&&(!m||(m==='af'?x[5]!==0:m==='maf'?Math.abs(x[5]||0)>=.5:x[5]===0)));
-  $('#acnt').textContent=rs.length.toLocaleString()+' variables'+(rs.length>500?' (first 500)':'');
-  $('#atb').innerHTML=rs.slice(0,500).map(x=>`<tr class="cl" data-v="${esc(x[0])}"><td><a class="v">${esc(x[0])}</a></td><td class="small">${esc(x[1]).slice(0,60)}</td><td class="n ${cls(x[2])}">${fmt(x[2])}</td><td class="n ${cls(x[3])}">${pct(x[3])}</td><td class="n">${sh(x[4])}</td><td class="n"><b>${sh(x[5])}</b></td><td>${x[6]?vlink(x[6])+(x[7]?` <span class="small ${cls(x[7][0])}">(${fmt(x[7][0])} in ${esc(x[7][1])})</span>`:' <span class="small mut">(unchanged)</span>'):'<span class="mut small">residual (no '+esc(M.af_suffix)+' series)</span>'}</td></tr>`).join('')};
- $('#aq').addEventListener('input',r);$('#am').addEventListener('input',r);r()})();
+ const NP=D.afrows[0][5].length,P=i=>D.per[i+D.wsi];
+ $('#t-afx').innerHTML=`<div class="hint">For every variable with an equation: how much of its gap (B−A) comes from its <b>formula</b> (its inputs changed) versus its <b>add-factor</b> (${esc(M.af_suffix)} series or residual changed). The equation is the same in both scenarios, so whatever the formula does not explain comes from the add-factor. Move the slider to check any quarter, or use the whole window.</div>
+ <div class="ctl" style="align-items:center"><select id="amode"><option value="p">At one quarter</option><option value="w">Whole window (sum of all quarters)</option></select>
+ <input type="range" id="asl" min="0" max="${NP-1}" value="${NP-1}" style="flex:1;min-width:200px"><b id="alab">${esc(P(NP-1))}</b></div>
+ <div class="ctl"><input type="text" id="aq" placeholder="Search"><select id="am"><option value="">All</option><option value="af" selected>Add-factor changed</option><option value="maf">Mostly add-factor (≥50%)</option><option value="f">Formula only</option></select><select id="as"><option value="s">Sort by size of change</option><option value="a">Sort by add-factor share</option></select></div><div id="acnt" class="hint"></div>
+ <div class="tw"><table><thead><tr><th>Series</th><th>Description</th><th class="n">Gap (B−A)</th><th class="n">From formula</th><th class="n">From add-factor</th><th class="n">Other</th><th>Add-factor series</th></tr></thead><tbody id="atb"></tbody></table></div><div class="ctl" id="amore"></div>`;
+ const sh=v=>v==null?'–':Math.round(v*100)+'%';let lim=500;
+ const val=(x,i,w)=>{const sum=a=>a?a.reduce((s,v)=>s+(v||0),0):0;if(w)return[sum(x[5]),sum(x[6]),sum(x[7])];return[x[5][i],x[6][i],x[7]?x[7][i]:0]};
+ const r=()=>{const q=$('#aq').value.trim().toUpperCase(),m=$('#am').value,w=$('#amode').value==='w',i=+$('#asl').value;
+  $('#asl').disabled=w;$('#alab').textContent=w?`${M.ws}–${M.we}`:P(i);
+  let rs=D.afrows.map(x=>{const [g,f,a]=val(x,i,w),ok=g!=null&&Math.abs(g)>1e-12;return [x,g,ok?f/g:null,ok?(a||0)/g:null,ok?(g-(f||0)-(a||0))/g:null]})
+   .filter(([x,g,fs,as])=>(!q||x[0].includes(q)||x[1].toUpperCase().includes(q))&&(!m||(m==='af'?x[7]!==null:m==='maf'?Math.abs(as||0)>=.5:x[7]===null)));
+  if($('#as').value==='a')rs.sort((u,v)=>Math.abs(v[3]||0)-Math.abs(u[3]||0));
+  $('#acnt').textContent=rs.length.toLocaleString()+' variables'+(rs.length>lim?` (showing ${lim.toLocaleString()})`:'');
+  $('#atb').innerHTML=rs.slice(0,lim).map(([x,g,fs,as,os])=>`<tr class="cl" data-v="${esc(x[0])}"><td><a class="v">${esc(x[0])}</a></td><td class="small">${esc(x[1]).slice(0,60)}</td><td class="n ${cls(g)}">${fmt(g)}</td><td class="n">${sh(fs)}</td><td class="n"><b>${sh(as)}</b></td><td class="n mut">${os!=null&&Math.abs(os)>=.005?sh(os):''}</td><td>${x[2]?vlink(x[2])+(x[3]?` <span class="small ${cls(x[3][0])}">(${fmt(x[3][0])} in ${esc(x[3][1])})</span>`:' <span class="small mut">(unchanged)</span>'):(x[7]?'<span class="mut small">residual (no '+esc(M.af_suffix)+' series)</span>':'')}</td></tr>`).join('');
+  $('#amore').innerHTML=rs.length>lim?`<button class="btn" id="am2">Show all ${rs.length.toLocaleString()}</button>`:'';if(rs.length>lim)$('#am2').onclick=()=>{lim=rs.length;r()}};
+ ['aq','am','as','amode','asl'].forEach(id=>$('#'+id).addEventListener('input',()=>{if(id!=='asl')lim=500;r()}));r()})();
+
+// ---------- influence
+function infSummary(r,what){return `<div class="kpis"><div class="kpi"><span class="mut small">linked through equations</span><b>${r.reach.toLocaleString()}</b></div><div class="kpi"><span class="mut small">actually move (≥${r.thr}%)</span><b>${r.moved.toLocaleString()}</b></div><div class="kpi"><span class="mut small">move ≥ 1%</span><b>${r.ge1.toLocaleString()}</b></div><div class="kpi"><span class="mut small">0.1–1%</span><b>${r.b01.toLocaleString()}</b></div><div class="kpi"><span class="mut small">${r.thr}–0.1%</span><b>${r.b001.toLocaleString()}</b></div></div>
+ <div class="hint">${what}. ${r.resolved.toLocaleString()} equations re-solved${r.blocked?`; ${r.blocked} linked variables have no evaluable equation and were held fixed`:''}. Largest effect over ${esc(M.ws)}–${esc(M.we)}, as % of the scenario-A level:</div>
+ <div class="tw"><table><thead><tr><th>Variable</th><th>Description</th><th class="n">Largest effect</th><th class="n">%</th><th>When</th></tr></thead><tbody>${r.top.map(t=>`<tr><td>${vlink(t[0])}</td><td class="small">${esc(desc(t[0])).slice(0,60)}</td><td class="n ${cls(t[1])}">${fmt(t[1])}</td><td class="n ${cls(t[1])}">${t[2]==null?'–':(t[1]<0?'−':'+')+t[2].toFixed(2)+'%'}</td><td>${esc(t[3])}</td></tr>`).join('')}</tbody></table></div>`}
+(function(){if(!M.has_eqs)return;
+ const sh=Object.values(D.infl);
+ let h=`<div class="hint">If one variable changes, how many others move, and by how much? <b>Linked</b> = variables that use it directly or indirectly in their equations. <b>Move</b> = the change is re-run through the equations with everything else held at scenario A, and a variable counts if it moves by at least 0.01% of its level.</div>
+ <div class="ctl"><input type="text" id="ix" placeholder="Any variable, e.g. FOIL">${SERVE?'<select id="is"><option value="">its change from A to B</option><option value="1%">+1%</option><option value="-1%">−1%</option><option value="1">+1 unit</option><option value="0.25">+0.25 unit</option></select>':''}<button class="btn" id="igo">Show</button></div><div id="iout"></div>`;
+ if(sh.length){h+=`<h2>Each scenario shock on its own</h2><div class="tw"><table><thead><tr><th>Shock</th><th>Type</th><th class="n">Linked</th><th class="n">Move</th><th class="n">≥1%</th><th class="n">0.1–1%</th><th class="n">&lt;0.1%</th><th>Most affected</th></tr></thead><tbody>${sh.map(r=>`<tr class="cl" data-inf="${esc(r.x)}"><td>${vlink(r.x)}${r.mode==='addfactor'&&r.target!==r.x?' <span class="small mut">→ '+esc(r.target)+'</span>':r.mode==='addfactor'?' <span class="small mut">(its add-factor)</span>':''}</td><td>${badge(ROW[r.x]?ROW[r.x][9]:'')}</td><td class="n">${r.reach.toLocaleString()}</td><td class="n"><b>${r.moved.toLocaleString()}</b></td><td class="n">${r.ge1}</td><td class="n">${r.b01}</td><td class="n">${r.b001}</td><td class="small">${r.top.slice(0,3).map(t=>esc(t[0])+' '+(t[2]==null?'':(t[1]<0?'−':'+')+t[2].toFixed(2)+'%')).join(', ')}</td></tr>`).join('')}</tbody></table></div><div class="hint">Click a row for the full list.</div>`}
+ $('#t-inf').innerHTML=h;
+ $('#t-inf').addEventListener('click',e=>{const r=e.target.closest('[data-inf]');if(r&&!e.target.closest('a')){$('#ix').value=r.dataset.inf;go()}});
+ const go=()=>{const x=$('#ix').value.trim().toUpperCase(),i=NI[x];if(i==null){$('#iout').innerHTML=`<div class="card">${esc(x)} not found. ${sugg(x)}</div>`;return}
+  const shock=SERVE?$('#is').value:'',afT=D.infl[x]&&D.infl[x].mode==='addfactor'?D.infl[x].target:null,direct=CH[i].length;
+  let h=`<div class="card"><b>${esc(x)}</b> ${afT&&afT!==x?'is the add-factor of '+vlink(afT)+'; it':afT?'is moved by its own add-factor; it is used directly in <b>'+direct+'</b> other equation(s) and':'is used directly in <b>'+direct+'</b> equation(s) and'} is linked to <b>${(afT?D.infl[x].reach:D.reach[i]).toLocaleString()}</b> variables in total${afT?' (through its add-factor, including '+esc(afT)+' itself)':''}.${direct||afT?'':' It is an end point: changing it moves nothing else.'}</div>`;
+  if(!direct&&!afT){$('#iout').innerHTML=h;return}
+  if(!shock&&D.infl[x]){const r=D.infl[x];$('#iout').innerHTML=h+infSummary(r,r.mode==='addfactor'?`Effect of the add-factor change of ${esc(r.target)} (from A to B)`:`Effect of ${esc(x)}'s own change from A to B`);return}
+  if(!SERVE){$('#iout').innerHTML=h+`<div class="hint">To see how much the linked variables move, run <code>python scenario_compare.py serve …</code> (any variable, any shock) or <code>influence ${esc(x)}</code> in the terminal.</div>`;return}
+  $('#iout').innerHTML=h+'<div class="hint">Re-solving the equations…</div>';
+  fetch(`/api/influence?x=${encodeURIComponent(x)}&shock=${encodeURIComponent(shock)}`).then(r=>r.json()).then(o=>{
+   $('#iout').innerHTML=h+(o.error?`<div class="card">${esc(o.error)}</div>`:infSummary(o,shock?`Effect of a ${esc(shock)}${shock.endsWith('%')?'':' unit'} change in ${esc(x)}`:`Effect of ${esc(x)}'s own change from A to B`))})};
+ $('#igo').onclick=go;$('#ix').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+})();
 
 // ---------- by concept / geography
 (function(){
- if(D.stem.length){$('#t-stem').innerHTML=`<div class="hint">Same concept across geographies (name before the geography suffix). Shows how widespread a change is.</div><div class="tw"><table><thead><tr><th>Concept</th><th>Description</th><th class="n">Geos changed</th><th class="n">of</th><th class="n">Median |gap at end %|</th><th class="n">Max score</th><th>Largest</th></tr></thead><tbody>${D.stem.slice(0,1500).map(r=>`<tr><td><b>${esc(r[0])}</b></td><td class="small">${esc(r[6]).slice(0,70)}</td><td class="n">${r[1]}</td><td class="n mut">${r[2]}</td><td class="n">${r[3]==null?'–':r[3].toFixed(2)+'%'}</td><td class="n">${fmt(r[4])}</td><td class="small">${r[5].map(vlink).join(', ')}</td></tr>`).join('')}</tbody></table></div>`}
- if(D.geo.length){$('#t-geo').innerHTML=`<div class="tw"><table><thead><tr><th>Geography</th><th class="n">Series changed</th><th class="n">of</th><th class="n">Median score</th><th>Largest changes</th></tr></thead><tbody>${D.geo.map(r=>`<tr><td><b>${esc(r[0]||'(none)')}</b></td><td class="n">${r[1]}</td><td class="n mut">${r[2]}</td><td class="n">${fmt(r[3])}</td><td class="small">${r[4].map(vlink).join(', ')}</td></tr>`).join('')}</tbody></table></div>`}
+ const note=M.has_eqs?`<div class="hint">A series counts as <b>changed</b> only if the scenario changed it directly: an assumption, or its add-factor changed. Series with the same equation and the same add-factor that moved only because their inputs moved are counted under <b>via formula only</b>. Click a row for the full list.</div>`:'<div class="hint">Click a row for the full list.</div>';
+ const esc2=t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+ if(D.stem.length){$('#t-stem').innerHTML=note+`<div class="tw"><table><thead><tr><th>Concept</th><th>Description</th><th class="n">Geos changed</th>${M.has_eqs?'<th class="n">Via formula only</th><th class="n">Not evaluable</th>':''}<th class="n">of</th><th class="n">Median |gap at end %| (changed)</th><th>Largest</th></tr></thead><tbody>${D.stem.slice(0,3000).map(r=>`<tr class="cl" data-stem="${esc(r[0])}"><td><b>${esc(r[0])}</b></td><td class="small">${esc(r[8]).slice(0,70)}</td><td class="n"><b>${r[1]}</b></td>${M.has_eqs?`<td class="n mut">${r[2]}</td><td class="n mut">${r[3]||''}</td>`:''}<td class="n mut">${r[4]}</td><td class="n">${r[5]==null?'–':r[5].toFixed(2)+'%'}</td><td class="small">${r[7].map(vlink).join(', ')}</td></tr>`).join('')}</tbody></table></div>`;
+  $('#t-stem').addEventListener('click',e=>{const t=e.target.closest('[data-stem]');if(t&&!e.target.closest('a'))KC.set({q:'^'+esc2(t.dataset.stem)+esc2(D.meta.geo_sep||'.')})})}
+ if(D.geo.length){$('#t-geo').innerHTML=note+`<div class="tw"><table><thead><tr><th>Geography</th><th class="n">Series changed</th>${M.has_eqs?'<th class="n">Via formula only</th><th class="n">Not evaluable</th>':''}<th class="n">of</th><th class="n">Median score (changed)</th><th>Largest changes</th></tr></thead><tbody>${D.geo.map(r=>`<tr class="cl" data-geo="${esc(r[0])}"><td><b>${esc(r[0]||'(none)')}</b></td><td class="n"><b>${r[1]}</b></td>${M.has_eqs?`<td class="n mut">${r[2]}</td><td class="n mut">${r[3]||''}</td>`:''}<td class="n mut">${r[4]}</td><td class="n">${fmt(r[5])}</td><td class="small">${r[6].map(vlink).join(', ')}</td></tr>`).join('')}</tbody></table></div>`;
+  $('#t-geo').addEventListener('click',e=>{const t=e.target.closest('[data-geo]');if(t&&!e.target.closest('a'))KC.set({g:t.dataset.geo||'__none__'})})}
 })();
 
 // ---------- path tracing
@@ -2556,25 +3155,34 @@ function downHTML(x,depth){const xi=NI[x];if(xi==null)return'';
   if(NI[x]==null){$('#pout').innerHTML=`<div class="card">${esc(x)} not found. ${sugg(x)}</div>`;return}
   if(y&&NI[y]==null){$('#pout').innerHTML=`<div class="card">${esc(y)} not found. ${sugg(y)}</div>`;return}
   $('#pout').innerHTML=y?'<h2>Channels</h2>'+pathHTML(x,y):`<h2>What ${esc(x)} feeds</h2>`+downHTML(x,+$('#pd').value);
-  if(SERVE)runImpact(x,y,$('#ps').value)};
+  if(SERVE)runImpact(x,y,$('#ps').value);else if(y&&staticImpact(x,y))$('#pimp').insertAdjacentHTML('afterbegin','<div class="hint">Exact effect from the Summary tab (precomputed for scenario shocks → key variables). For any other pair, use <code>serve</code>.</div>')};
  $('#pgo').onclick=go;['px','py'].forEach(i=>$('#'+i).addEventListener('keydown',e=>{if(e.key==='Enter')go()}));
 })();
 function runImpact(x,y,shock){$('#pimp').innerHTML='<div class="hint">Re-solving the equations…</div>';
- fetch(`/api/impact?x=${encodeURIComponent(x)}&y=${encodeURIComponent(y)}&shock=${encodeURIComponent(shock)}`).then(r=>r.json()).then(o=>{
+ fetch(`/api/impact?x=${encodeURIComponent(x)}&y=${encodeURIComponent(y)}&shock=${encodeURIComponent(shock)}`).then(r=>r.json()).then(o=>renderImpact(o,x,y,shock))}
+function renderImpact(o,x,y,shock){
   if(o.error){$('#pimp').innerHTML=`<div class="card">${esc(o.error)}</div>`;return}
   if(o.none){$('#pimp').innerHTML=`<div class="card"><b>No.</b> ${esc(x)} cannot affect ${esc(y)}: no chain of equations links them.</div>`;return}
-  const what=shock?`a ${esc(shock)}${shock.endsWith('%')?'':' unit'} change in ${esc(x)}`:`${esc(x)}'s change from A to B`;
-  let h='';
-  if(y&&o.y){const i=o.y.length-1,v=o.y[i],g=o.gap[i],a=o.ya[i];
-   h+=`<div class="card"><b>Effect of ${what} on ${esc(y)}</b> at ${esc(o.per[i])}: <b class="${cls(v)}">${fmt(v)}</b> (${pct(a?100*v/Math.abs(a):null)})${!shock&&g?` = <b>${Math.round(100*v/g)}%</b> of ${esc(y)}'s total gap (${fmt(g)})`:''}. ${o.nodes} equations re-solved.${o.blocked.length?` <span class="mut small">${o.blocked.length} variables in between have no evaluable equation and were held fixed.</span>`:''}</div>`;
-   h+=lineChart2(o.y,shock?null:o.gap,o.per,'Effect of '+x,'Total gap B−A')}
-  else if(y&&!o.y)h+=`<div class="card">${esc(y)} has no evaluable equation, so the effect cannot be simulated.</div>`;
-  if(o.top&&o.top.length)h+=`<h2>${y?'Variables in between':'Most affected variables'} (effect at ${esc(o.per[o.per.length-1])})</h2><div class="tw"><table><thead><tr><th>Variable</th><th class="n">Effect</th><th class="n">%</th></tr></thead><tbody>${o.top.map(r=>`<tr><td>${vlink(r[0])}</td><td class="n ${cls(r[1])}">${fmt(r[1])}</td><td class="n ${cls(r[2])}">${pct(r[2])}</td></tr>`).join('')}</tbody></table></div>`;
-  $('#pimp').innerHTML=h})}
-function lineChart2(a,b,per,la,lb){const W=640,H=180,L=56,R=8,T=10,B=24,n=per.length;const vs=a.concat(b||[]).concat([0]).filter(v=>v!=null);let lo=Math.min(...vs),hi=Math.max(...vs);if(lo===hi)hi=lo+1;
+  const what=shock?`a ${esc(shock)}${shock.endsWith('%')?'':' unit'} change in ${esc(x)}`:`${esc(x.startsWith('AF:')?'the add-factor on '+x.slice(3):x)}'s change from A to B`,NP=o.per.length;
+  $('#pimp').innerHTML=`<div class="ctl" style="align-items:center"><span class="small mut">Quarter</span><input type="range" id="isl" min="0" max="${NP-1}" value="${NP-1}" style="flex:1;min-width:200px"><b id="ilab"></b></div><div id="ibody"></div>`;
+  const draw=()=>{const i=+$('#isl').value;$('#ilab').textContent=o.per[i];let h='';
+   if(y&&o.y){const v=o.y[i],g=o.gap?o.gap[i]:null,a=o.ya?o.ya[i]:null;
+    h+=`<div class="card"><b>Effect of ${what} on ${esc(y)}</b> at <b>${esc(o.per[i])}</b>: <b class="${cls(v)}">${fmt(v)}</b>${a?' ('+pct(100*v/Math.abs(a))+')':''}${!shock&&g?` = <b>${Math.round(100*v/g)}%</b> of ${esc(y)}'s gap (${fmt(g)})`:''}.${o.nodes!=null?` ${o.nodes} equations re-solved.`:''}${o.blocked&&o.blocked.length?` <span class="mut small">${o.blocked.length} variables in between have no evaluable equation and were held fixed.</span>`:''}</div>`;
+    h+=lineChart2(o.y,shock?null:o.gap,o.per,'Effect of '+(x.startsWith('AF:')?'add-factor on '+x.slice(3):x),'Total gap B−A',i);
+    if(!shock&&o.gap){const sh=o.y.map((v,k)=>o.gap[k]&&Math.abs(o.gap[k])>1e-9*Math.max(...o.gap.map(z=>Math.abs(z||0)))?100*v/o.gap[k]:null);h+=`<div class="small mut" style="margin-top:6px">Share of ${esc(y)}'s gap from ${esc(x)}, by quarter (%):</div>`+lineChart2(sh,null,o.per,'share of gap, %','',i)}}
+   else if(y&&!o.y)h+=`<div class="card">${esc(y)} has no evaluable equation, so the effect cannot be simulated.</div>`;
+   if(o.top&&o.top.length){const rs=o.top.slice().sort((a,b)=>Math.abs(b[2][i]||0)-Math.abs(a[2][i]||0)).slice(0,40);
+    h+=`<h2>${y?'Variables in between':'Most affected variables'} at ${esc(o.per[i])}</h2><div class="tw"><table><thead><tr><th>Variable</th><th class="n">Effect</th><th class="n">%</th><th class="n">Largest % (any quarter)</th></tr></thead><tbody>${rs.map(r=>{const m=r[2].reduce((s,p)=>p!=null&&Math.abs(p)>Math.abs(s)?p:s,0);return `<tr><td>${vlink(r[0])}</td><td class="n ${cls(r[1][i])}">${fmt(r[1][i])}</td><td class="n ${cls(r[2][i])}">${pct(r[2][i])}</td><td class="n mut">${pct(m)}</td></tr>`}).join('')}</tbody></table></div>`}
+   $('#ibody').innerHTML=h};
+  $('#isl').addEventListener('input',draw);draw()}
+function staticImpact(x,y){const S=D.summary;if(!S||!y||!S.attr[y])return false;
+ const ids=[x,'AF:'+x];let r=null;for(const id of ids){r=S.attr[y].rows.find(z=>z[0]===id);if(r){x=id;break}}if(!r)return false;
+ renderImpact({per:S.per,y:r[1],gap:S.attr[y].gap,ya:null,nodes:null,blocked:[],top:[]},x,y,'');return true}
+function lineChart2(a,b,per,la,lb,sel){const W=640,H=180,L=56,R=8,T=10,B=24,n=per.length;const vs=a.concat(b||[]).concat([0]).filter(v=>v!=null);let lo=Math.min(...vs),hi=Math.max(...vs);if(lo===hi)hi=lo+1;
  const X=i=>L+(W-L-R)*(n>1?i/(n-1):.5),Y=v=>T+(H-T-B)*(1-(v-lo)/(hi-lo));const pl=arr=>arr.map((v,i)=>v==null?'':(i&&arr[i-1]!=null?'L':'M')+X(i).toFixed(1)+','+Y(v).toFixed(1)).join('');
- return `<svg viewBox="0 0 ${W} ${H}" width="100%"><line x1="${L}" x2="${W-R}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)"/><text x="${L-6}" y="${Y(hi)+8}" text-anchor="end">${fmt(hi)}</text><text x="${L-6}" y="${Y(lo)}" text-anchor="end">${fmt(lo)}</text><text x="${L}" y="${H-6}">${esc(per[0])}</text><text x="${W-R}" y="${H-6}" text-anchor="end">${esc(per[n-1])}</text>
+ return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:780px">${sel!=null?`<line x1="${X(sel)}" x2="${X(sel)}" y1="${T}" y2="${H-B}" stroke="var(--mut)" stroke-dasharray="3,3"/>${a[sel]!=null?`<circle cx="${X(sel)}" cy="${Y(a[sel])}" r="4" fill="var(--b)"/>`:''}`:''}<line x1="${L}" x2="${W-R}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)"/><text x="${L-6}" y="${Y(hi)+8}" text-anchor="end">${fmt(hi)}</text><text x="${L-6}" y="${Y(lo)}" text-anchor="end">${fmt(lo)}</text><text x="${L}" y="${H-6}">${esc(per[0])}</text><text x="${W-R}" y="${H-6}" text-anchor="end">${esc(per[n-1])}</text>
  ${b?`<path d="${pl(b)}" fill="none" stroke="var(--mut)" stroke-width="2" stroke-dasharray="4,3"/>`:''}<path d="${pl(a)}" fill="none" stroke="var(--b)" stroke-width="2.5"/></svg><div class="small"><span style="color:var(--b)">━ ${esc(la)}</span>${b?` &nbsp; <span class="mut">╍ ${esc(lb)}</span>`:''}</div>`}
+document.addEventListener('click',e=>{const g=e.target.closest('g.mn');if(g)show(g.dataset.v)});
 function sugg(x){if(!x)return'';const m=D.nodes.filter(n=>n.includes(x)).slice(0,12);return m.length?'Did you mean: '+m.map(vlink).join(', '):''}
 
 // ---------- charts
@@ -2605,12 +3213,13 @@ function show(n,noPush){
  if(!noPush){hist.push(n)}
  const r=ROW[n],v=D.vals[n],d=D.dec[n],eq=D.eqt[n],kind=r?r[9]:(M.has_eqs?(eq?'':'X'):'-');
  let h=`<div class="dh"><div>${hist.length>1?'<button class="btn" id="bk">← Back</button> ':''}</div><button class="btn" id="cx">Close ✕</button></div>
- <h2 style="margin-top:8px">${esc(n)} ${badge(r?r[9]:'')}</h2><div class="mut">${esc(desc(n))}</div>`;
+ <h2 style="margin-top:8px">${esc(n)} ${badge(r?r[9]:'',n)}</h2><div class="mut">${esc(desc(n))}</div>`;
  if(r)h+=`<div class="kpis"><div class="kpi"><span class="mut small">gap at end (B−A)</span><b class="${cls(r[6])}">${fmt(r[6])}</b><span class="small ${cls(r[7])}">${pct(r[7])}</span></div><div class="kpi"><span class="mut small">largest gap</span><b class="${cls(r[4])}">${fmt(r[4])}</b><span class="small ${cls(r[5])}">${pct(r[5])}</span></div><div class="kpi"><span class="mut small">first differs</span><b>${esc(r[8])}</b></div><div class="kpi"><span class="mut small">score</span><b>${fmt(r[3])}</b></div></div>`;
  else h+=`<div class="card">No difference between A and B in the window${(n in D.vals)?'':' (or series not in the data)'}.</div>`;
  if(v){h+=lineChart(v[0],v[1],D.per,D.wsi);const df=v[0].map((x,i)=>x==null||v[1][i]==null?null:v[1][i]-x);h+=barChart(df,D.per,'Gap B − A by period')}
  else if(r)h+=`<div class="hint">Time series not embedded for this variable (raise --embed to include more).</div>`;
- if(eq){h+=`<h2>Equation</h2><pre class="eq">${esc(eq)}</pre>`;if(D.why[n])h+=`<div class="hint">${esc(D.why[n])}</div>`;if(D.afmap[n])h+=`<div class="hint">Add-factor series: ${vlink(D.afmap[n])} ${gapTxt(D.afmap[n])}</div>`}
+ if(eq&&EXOG.has(n))h+=`<h2>Equation (switched off)</h2><pre class="eq">${esc(eq)}</pre><div class="card">The team set <b>${esc(n)}</b> exogenously, so this equation is not used: its whole gap is a scenario choice, and shocks to its inputs stop here.</div>`;
+ else if(eq){h+=`<h2>Equation</h2><pre class="eq">${esc(eq)}</pre>`;if(D.why[n])h+=`<div class="hint">${esc(D.why[n])}</div>`;if(D.afmap[n])h+=`<div class="hint">Add-factor series: ${vlink(D.afmap[n])} ${gapTxt(D.afmap[n])}</div>`}
  else if(M.has_eqs)h+=`<div class="card">No equation for ${esc(n)} — it is an <b>assumption</b> (exogenous). Its path is set directly by the scenario.</div>`;
  if(d&&d.err)h+=`<div class="card">Could not decompose: ${esc(d.err)}</div>`;
  else if(d)h+=decHTML(n,d);
@@ -2618,13 +3227,14 @@ function show(n,noPush){
  else if(r&&eq&&!D.dec[n]){const l=D.esh[NI[n]];if(l&&l.length){h+=`<h2>Why it changed</h2><div class="hint">Share of the change in its left-hand side coming from each driver:</div>`+l.slice().sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).map(e=>`${vlink(D.nodes[e[0]])} ${Math.round(e[1]*100)}%`).join(' · ')+(D.afsh[NI[n]]!=null?` · <i>add-factor</i> ${D.afmap[n]?vlink(D.afmap[n]):''} <b>${Math.round(D.afsh[NI[n]]*100)}%</b>`:'')}}
  const ps=(D.par[NI[n]]||[]).map(i=>D.nodes[i]),cs=(CH[NI[n]]||[]).map(i=>D.nodes[i]);
  if(ps.length)h+=`<h2>Drivers in its equation</h2><div>${ps.map(p=>`${vlink(p)} ${gapTxt(p)}`).join(' &nbsp;·&nbsp; ')}</div>`;
+ if(M.has_eqs&&NI[n]!=null&&cs.length)h+=`<div class="hint">Linked to ${D.reach[NI[n]].toLocaleString()} variables in total (directly or indirectly). See the Influence tab for how much they move.</div>`;
  if(!cs.length&&M.has_eqs)h+=`<h2>Feeds into</h2><div class="hint">Nothing — no other equation uses ${esc(n)}. It is an end point of the model.</div>`;
  if(cs.length){const cd=cs.filter(c=>ROW[c]),cn=cs.length-cd.length;h+=`<h2>Feeds into</h2><div class="hint">${cs.length} variable(s) use ${esc(n)} in their equations${cn?`; ${cn} of them do not differ`:''}.</div><div>${cd.sort((a,b)=>ROW[b][3]-ROW[a][3]).slice(0,60).map(c=>{const sh=esh(c,n);return `${vlink(c)} ${gapTxt(c)}${sh!=null?` <span class="small mut">(${Math.round(sh*100)}% from ${esc(n)})</span>`:''}`}).join(' &nbsp;·&nbsp; ')}</div>`}
  const det=$('#det');det.innerHTML=h;det.classList.add('open');det.scrollTop=0;
  $('#cx').onclick=()=>{det.classList.remove('open');hist.length=0};
  const bk=$('#bk');if(bk)bk.onclick=()=>{hist.pop();show(hist[hist.length-1],true)};
  const pb=$('#pb');if(pb)pb.onclick=()=>{$('#ptab').classList.toggle('hide')};
- const dp=$('#dper');if(dp)dp.onchange=()=>{$('#dbars').innerHTML=decBars(n,D.dec[n],+dp.value)};
+ const dsl=$('#dsl');if(dsl){const dd=D.dec[n];decUpdate(n,dd,+dsl.value);dsl.oninput=()=>decUpdate(n,dd,+dsl.value)}
  const at=$('#atb2');if(at)at.onclick=()=>{$('#atout').innerHTML='<div class="hint">Re-solving…</div>';fetch('/api/attr?y='+encodeURIComponent(n)).then(r=>r.json()).then(o=>{if(o.error){$('#atout').innerHTML=`<div class="card">${esc(o.error)}</div>`;return}
   const i=o.iend,g=o.gap[i],mx=Math.max(1e-30,...o.rows.map(r=>Math.abs(r[3][i]||0)));let s=0;o.rows.forEach(r=>s+=r[3][i]||0);
   $('#atout').innerHTML=`<div class="hint">Gap at ${esc(o.per[i])}: <b>${fmt(g)}</b>. Each line re-solves the model with only that shock switched from A to B.</div><table class="bars">${o.rows.map(r=>`<tr><td style="width:42%">${r[1]==='addfactor'?'add-factor of '+vlink(r[0])+(r[2]?' ('+esc(r[2])+')':''):vlink(r[0])}</td><td style="width:34%">${bar(r[3][i],mx)}</td><td class="n">${fmt(r[3][i])}</td><td class="n mut">${g?Math.round(100*r[3][i]/g)+'%':''}</td></tr>`).join('')}<tr><td><i>Interaction between shocks</i></td><td></td><td class="n">${fmt(g-s)}</td><td class="n mut">${g?Math.round(100*(g-s)/g)+'%':''}</td></tr></table>`})};
@@ -2639,16 +3249,47 @@ function decBars(n,d,i){
  const sh=v=>g&&Math.abs(g)>1e-12*mx?Math.round(100*(v||0)/g)+'%':'';
  let h=`<table class="bars"><tr><td style="width:40%"><b>Gap B−A</b></td><td style="width:34%">${bar(g,mx)}</td><td class="n"><b>${fmt(g)}</b></td><td class="n mut">100%</td></tr>`;
  h+=rows.map(r=>`<tr><td>${r[0]==='__AF__'?`<i>Add-factor</i> ${d.afn?vlink(d.afn):'<span class="small mut">(residual)</span>'}`:r[0]==='__INT__'?'<i>Interaction (non-linear)</i>':vlink(r[0])+' '+badge(ROW[r[0]]?ROW[r[0]][9]:'')}</td><td>${bar(r[1],mx)}</td><td class="n">${fmt(r[1])}</td><td class="n mut">${sh(r[1])}</td></tr>`).join('');
- if(!d.cols.length&&!d.af)h+=`<tr><td colspan="4" class="mut">None of its drivers differ and its add-factor did not change${g?'':' — that is why it did not move'}.</td></tr>`;
+ if(!d.cols.length&&!d.af)h+=`<tr><td colspan="4" class="mut">None of its inputs differ and its add-factor did not change${g?'':' — that is why it did not move'}.</td></tr>`;
  return h+'</table>'}
+const PAL=['#2563eb','#0f9d58','#7a5af8','#c2185b','#00838f','#8d6e63','#5c6bc0'],AFC='#f59e0b';
+function decSeries(d){const top=d.cols.slice(0,6),rest=d.cols.slice(6),out=top.map((c,k)=>({name:c[0],v:c[1],c:PAL[k]}));
+ if(rest.length)out.push({name:`${rest.length} other input(s)`,v:d.gap.map((_,i)=>rest.reduce((s,c)=>s+(c[1][i]||0),0)),c:'#9aa4b2'});
+ if(d.af)out.push({name:'Add-factor'+(d.afn?' '+d.afn:''),v:d.af,c:AFC});return out}
+function stackChart(d,sel){
+ const S=decSeries(d),n=d.gap.length,W=640,H=210,L=56,R=8,T=10,B=24;let lo=0,hi=0;
+ for(let i=0;i<n;i++){let p=0,m=0;S.forEach(s=>{const v=s.v[i]||0;if(v>0)p+=v;else m+=v});lo=Math.min(lo,m,d.gap[i]||0);hi=Math.max(hi,p,d.gap[i]||0)}if(lo===hi)hi=1;
+ const bw=(W-L-R)/n,X=i=>L+bw*i,Y=v=>T+(H-T-B)*(1-(v-lo)/(hi-lo));let r='';
+ for(let i=0;i<n;i++){let p=0,m=0;S.forEach(s=>{const v=s.v[i]||0;if(!v)return;const y0=v>0?p:m,y1=y0+v;if(v>0)p=y1;else m=y1;r+=`<rect x="${X(i)+1}" width="${Math.max(1,bw-2)}" y="${Math.min(Y(y0),Y(y1))}" height="${Math.max(.5,Math.abs(Y(y1)-Y(y0)))}" fill="${s.c}"><title>${esc(D.per[i+D.wsi])} · ${esc(s.name)}: ${fmt(v)}</title></rect>`})}
+ const gl=d.gap.map((v,i)=>v==null?'':(i&&d.gap[i-1]!=null?'L':'M')+(X(i)+bw/2).toFixed(1)+','+Y(v).toFixed(1)).join('');
+ return `<svg viewBox="0 0 ${W} ${H}" width="100%"><rect x="${X(sel)}" width="${bw}" y="${T}" height="${H-T-B}" fill="var(--hl)"/><line x1="${L}" x2="${W-R}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)"/>${r}<path d="${gl}" fill="none" stroke="var(--fg)" stroke-width="1.5"/>${d.gap.map((v,i)=>v==null?'':`<circle cx="${X(i)+bw/2}" cy="${Y(v)}" r="2" fill="var(--fg)"/>`).join('')}
+ <text x="${L-6}" y="${Y(hi)+8}" text-anchor="end">${fmt(hi)}</text><text x="${L-6}" y="${Y(lo)}" text-anchor="end">${fmt(lo)}</text><text x="${L}" y="${H-6}">${esc(D.per[D.wsi])}</text><text x="${W-R}" y="${H-6}" text-anchor="end">${esc(D.per[D.wsi+n-1])}</text></svg>
+ <div class="small">${S.map(s=>`<span style="white-space:nowrap;margin-right:10px"><span style="display:inline-block;width:10px;height:10px;background:${s.c};margin-right:4px"></span>${esc(s.name)}</span>`).join('')}<span style="white-space:nowrap">● ━ gap B−A</span></div>`}
+function shareChart(d,sel){
+ const n=d.gap.length,W=640,H=170,L=56,R=8,T=10,B=24,big=Math.max(1e-30,...d.gap.map(v=>Math.abs(v||0)));
+ const f=d.gap.map((g,i)=>g==null||Math.abs(g)<1e-3*big?null:Math.max(-1.5,Math.min(2.5,d.cols.reduce((s,c)=>s+(c[1][i]||0),0)/g)));
+ const a=d.af?d.gap.map((g,i)=>g==null||Math.abs(g)<1e-3*big?null:Math.max(-1.5,Math.min(2.5,(d.af[i]||0)/g))):null;
+ const vs=f.concat(a||[]).filter(v=>v!=null).concat([0,1]);const lo=Math.min(...vs),hi=Math.max(...vs);
+ const X=i=>L+(W-L-R)*(n>1?i/(n-1):.5),Y=v=>T+(H-T-B)*(1-(v-lo)/(hi-lo||1));const pl=arr=>arr.map((v,i)=>v==null?'':(i&&arr[i-1]!=null?'L':'M')+X(i).toFixed(1)+','+Y(v).toFixed(1)).join('');
+ return `<svg viewBox="0 0 ${W} ${H}" width="100%"><line x1="${X(sel)}" x2="${X(sel)}" y1="${T}" y2="${H-B}" stroke="var(--mut)" stroke-dasharray="3,3"/>
+ <line x1="${L}" x2="${W-R}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)"/><line x1="${L}" x2="${W-R}" y1="${Y(1)}" y2="${Y(1)}" stroke="var(--line)" stroke-dasharray="2,3"/>
+ <text x="${L-6}" y="${Y(1)+4}" text-anchor="end">100%</text><text x="${L-6}" y="${Y(0)+4}" text-anchor="end">0%</text><text x="${L}" y="${H-6}">${esc(D.per[D.wsi])}</text><text x="${W-R}" y="${H-6}" text-anchor="end">${esc(D.per[D.wsi+n-1])}</text>
+ <path d="${pl(f)}" fill="none" stroke="var(--a)" stroke-width="2"/>${a?`<path d="${pl(a)}" fill="none" stroke="${AFC}" stroke-width="2"/>`:''}</svg>
+ <div class="small"><span style="color:var(--a)">━ from formula</span>${a?` &nbsp; <span style="color:${AFC}">━ from add-factor</span>`:''} &nbsp; <span class="mut">(share of the gap in each quarter; hidden where the gap is ~0)</span></div>`}
 function decHTML(n,d){
- const i=d.iend;const opts=d.gap.map((g,k)=>`<option value="${k}" ${k===i?'selected':''}>${esc(D.per[k+D.wsi])}</option>`).join('');
- const fs=d.cols.reduce((s,c)=>s+(c[1][i]||0),0),g=d.gap[i];
- let h=`<h2>Where the gap comes from</h2><div class="hint">Each line is what the gap of ${esc(n)} would be if <i>only</i> that input moved from A to B, with the equation re-solved through time (effects that build up through its own lags are credited to the input that caused them). The formula is the same in both scenarios, so the rest comes from the <b>add-factor</b>.${g?` At ${esc(D.per[i+D.wsi])}: <b>${Math.round(100*fs/g)}%</b> from the formula${d.af?`, <b>${Math.round(100*d.af[i]/g)}%</b> from the add-factor`:''}.`:''}</div>
- <div class="ctl"><label class="small mut">Period <select id="dper">${opts}</select></label></div><div id="dbars">${decBars(n,d,i)}</div>`;
- if(d.cols.length||d.af){const ks=d.cols.slice(0,8);h+=`<p><button class="btn" id="pb">Show every period</button></p><div id="ptab" class="hide tw"><table><thead><tr><th>Period</th><th class="n">Gap</th>${ks.map(k=>`<th class="n">${esc(k[0])}</th>`).join('')}${d.af?'<th class="n">Add-factor</th>':''}</tr></thead><tbody>${d.gap.map((v,k)=>`<tr><td>${esc(D.per[k+D.wsi])}</td><td class="n">${fmt(v)}</td>${ks.map(c=>`<td class="n ${cls(c[1][k])}">${fmt(c[1][k])}</td>`).join('')}${d.af?`<td class="n ${cls(d.af[k])}">${fmt(d.af[k])}</td>`:''}</tr>`).join('')}</tbody></table></div>`}
+ const i=d.iend,NP=d.gap.length;
+ let h=`<h2>Where the gap comes from</h2><div class="hint">Each input's part is the gap ${esc(n)} would have if <i>only</i> that input moved from A to B, with the equation re-solved through time, so effects that build up through its own lags are credited to the input that caused them. The equation is the same in both scenarios, so the rest comes from the <b>add-factor</b>.</div>
+ <div id="dcharts"></div>
+ <div class="ctl" style="align-items:center"><span class="small mut">Quarter</span><input type="range" id="dsl" min="0" max="${NP-1}" value="${i}" style="flex:1;min-width:180px"><b id="dlab"></b></div>
+ <div id="dsum" class="hint"></div><div id="dbars"></div>`;
+ if(d.cols.length||d.af){const ks=d.cols.slice(0,8);h+=`<p><button class="btn" id="pb">Show every quarter as a table</button></p><div id="ptab" class="hide tw"><table><thead><tr><th>Period</th><th class="n">Gap</th>${ks.map(k=>`<th class="n">${esc(k[0])}</th>`).join('')}${d.af?'<th class="n">Add-factor</th>':''}</tr></thead><tbody>${d.gap.map((v,k)=>`<tr><td>${esc(D.per[k+D.wsi])}</td><td class="n">${fmt(v)}</td>${ks.map(c=>`<td class="n ${cls(c[1][k])}">${fmt(c[1][k])}</td>`).join('')}${d.af?`<td class="n ${cls(d.af[k])}">${fmt(d.af[k])}</td>`:''}</tr>`).join('')}</tbody></table></div>`}
  return h}
-tab('sum');
+function decUpdate(n,d,i){
+ $('#dlab').textContent=D.per[i+D.wsi];
+ const g=d.gap[i],fs=d.cols.reduce((s,c)=>s+(c[1][i]||0),0);
+ $('#dsum').innerHTML=g&&Math.abs(g)>1e-12?`At <b>${esc(D.per[i+D.wsi])}</b> the gap is <b>${fmt(g)}</b>: <b>${Math.round(100*fs/g)}%</b> from the formula${d.af?`, <b>${Math.round(100*(d.af[i]||0)/g)}%</b> from the add-factor`:''}.`:`At ${esc(D.per[i+D.wsi])} there is no gap.`;
+ $('#dbars').innerHTML=decBars(n,d,i);
+ if(d.cols.length||d.af)$('#dcharts').innerHTML=`<div class="small mut" style="margin-top:6px">Contribution of each input to the gap, by quarter (bars), and the gap itself (line):</div>`+stackChart(d,i)+`<div class="small mut" style="margin-top:6px">Share of the gap from the formula vs the add-factor, by quarter:</div>`+shareChart(d,i)}
+tab(D.summary?'story':'sum');
 </script></body></html>
 '''
 
@@ -2670,10 +3311,28 @@ def build_model(args):
     meta = load_meta(args.meta) if args.meta else None
     M = Model(A, B, eqs, addl, start=args.start, end=args.end, tol=args.tol, geo_sep=args.geo_sep,
               adj_threshold=args.adj_threshold, meta=meta, verbose=not getattr(args, 'quiet', False),
-              af_suffix=args.af_suffix)
+              af_suffix=args.af_suffix, exog=load_exog(args.exog))
     say('Loaded %d + %d series, %d periods, %d equations in %.1fs'
         % (len(A.series), len(B.series), M.T, len(eqs), time.time() - t0))
     return M, eqstats, fails
+
+
+def load_exog(items):
+    names = []
+    for it in items or ():
+        if os.path.isfile(it):
+            if os.path.splitext(it)[1].lower() in ('.xlsx', '.xlsm'):
+                text = ' '.join(str(c) for r in read_xlsx(it) for c in r)
+            else:
+                with open(it, 'r', encoding='utf-8-sig', errors='replace') as f:
+                    text = f.read()
+        else:
+            text = it
+        for tok in re.split(r'[\s,;]+', text):
+            tok = tok.strip().strip('"\'').upper()
+            if tok and not tok.startswith(("'", '#')):
+                names.append(tok)
+    return names
 
 
 def _label(paths):
@@ -2700,6 +3359,9 @@ def main(argv=None):
         sp.add_argument('--geo-sep', default='.', help='separator before geography code in names (default ".")')
         sp.add_argument('--adj-threshold', type=float, default=0.25,
                         help='flag a variable as "mostly add-factor" above this share of its change (0.25)')
+        sp.add_argument('--exog', action='append', metavar='LIST',
+                        help='variables the team set exogenously although they have an equation: a file '
+                             '(names separated by spaces, commas or new lines) or a comma-separated list. Repeatable.')
         sp.add_argument('--af-suffix', default='_A',
                         help='suffix of add-factor series, e.g. GDP.US_A (default _A; comma-separate several)')
         sp.add_argument('--quiet', action='store_true')
@@ -2711,6 +3373,12 @@ def main(argv=None):
                         help='max equations analysed for driver contributions (default 50000)')
         sp.add_argument('--context', type=int, default=8, help='periods of history shown before the window (8)')
         sp.add_argument('--focus', action='append', help='variable to always include in full detail (repeatable)')
+        sp.add_argument('--key', action='append', metavar='LIST',
+                        help='key variables for the Summary tab (file or comma list); default: picked automatically')
+        sp.add_argument('--summary-n', type=int, default=8,
+                        help='how many key variables to pick automatically for the Summary tab (default 8; 0 = off)')
+        sp.add_argument('--influence-n', type=int, default=20,
+                        help='scenario shocks whose influence is simulated for the Influence tab (default 20)')
 
     sp = sub.add_parser('report', help='build the interactive HTML report (a single file)')
     common(sp)
@@ -2752,6 +3420,13 @@ def main(argv=None):
     sp.add_argument('--by-period', action='store_true')
     sp.add_argument('-n', type=int, default=30, help='rows when Y is omitted')
 
+    sp = sub.add_parser('influence', help='if X changes, how many variables move and by how much')
+    sp.add_argument('x', nargs='?', help='variable (omit: table of all scenario shocks)')
+    common(sp)
+    sp.add_argument('--shock', help='hypothetical change instead of the A->B change: "1%%" or "0.25" (units)')
+    sp.add_argument('--thr', type=float, default=0.01, help='count a variable as moved above this %% of its level (0.01)')
+    sp.add_argument('-n', type=int, default=25)
+
     sp = sub.add_parser('attribute', help='split the gap of Y across all scenario shocks upstream of it')
     sp.add_argument('y')
     common(sp)
@@ -2771,6 +3446,8 @@ def main(argv=None):
         p.print_help()
         return 1
     M, eqstats, fails = build_model(args)
+    if hasattr(args, 'key'):
+        args.key_list = load_exog(args.key)
     if args.cmd == 'info':
         cmd_info(M, args, eqstats, fails)
     elif args.cmd == 'top':
@@ -2789,6 +3466,8 @@ def main(argv=None):
         cmd_impact(M, args)
     elif args.cmd == 'attribute':
         cmd_attribute(M, args)
+    elif args.cmd == 'influence':
+        cmd_influence(M, args)
     return 0
 
 
