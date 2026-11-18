@@ -65,7 +65,7 @@ Equations need **substituted coefficients** (numbers, not `C(1)`) to be decompos
 
 ## What's in the report
 
-- **Summary** (first tab): a written summary of how B differs from A, plus:
+- **Summary** (first tab): the transmission map can be zoomed (scroll or +/−) and moved (drag). A written summary of how B differs from A, plus:
   - the scenario's shocks, ranked by how much of the key variables they explain;
   - the **key variables**: the changed variables most others depend on, one per concept (or your own with `--key FGDP$.IUSA,FLBR.IUSA,…`);
   - the share of each key variable's gap coming from each shock, with a quarter slider;
@@ -98,7 +98,22 @@ For each variable, the shares of all shocks add up to about 100% (exactly 100% w
 - `--weight all`: every variable counts equally
 - `--weight key`: only the key variables from the Summary tab (or `--key …`)
 
-The output also gives how many variables a shock explains ≥10% / ≥50% of, and which variables it explains most. The CSV comes with `importance_matrix.csv`, listing every variable × shock share ≥1%. Speed: about 900 shocks on a 20,000-equation model take 35 seconds. Use `--no-importance` to skip it in the report.
+The output also gives how many variables a shock explains ≥10% / ≥50% of, and which variables it explains most. The CSV comes with `importance_matrix.csv`, listing every variable × shock share ≥1%.
+
+**Two methods:**
+- `--method fast` (default): traces each shock through the model using each equation's own split of its gap into inputs and add-factor (the same split as *Where the gap comes from*). `S(y,s) = Σ_k w_k(y)·S(k,s)`, with the model's loops solved by iteration. One pass over the model whatever the number of shocks (about 6 s on 20,000 equations after loading). It is exact for a linear model; on the demo, importance scores are within 1–2 points of the exact method and the ranking is the same.
+- `--method exact`: re-solves the model once per shock. Use it to confirm the top few: `--method exact --max-shocks 20`.
+
+**One geography only:** `importance --geo ICAN` (or the *Variables to explain* selector in the report) averages each shock's share only over that geography's variables. It answers "what drives the Canada forecast?". National or other-country shocks still rank if they move that geography. `--match REGEX` limits to variables by name or description instead.
+
+The report uses the fast method; `--importance-method exact` switches it, and `--no-importance` skips the tab.
+
+**Importance as a report:** add `-o` to `importance` to also write the full HTML report, opened on the Importance tab with your `--geo` and `--weight` already selected (same numbers as the terminal; nothing is computed twice):
+
+```bash
+python scenario_compare.py importance --a base.csv --b s4.csv --eq model.txt --geo ICAN -o s4.html
+```
+
 
 ## Equations that cannot be used
 
@@ -124,7 +139,34 @@ Functions the tool understands: all EViews functions that can appear in a series
 - **all cumulative statistics:** `@CUM*` and `@CUMB*`, with an optional sample
 - **sample statistics:** `@MEAN, @SUM, @STDEV, @MAX, @OBS, @QUANTILE, @FIRST, @LAST, …(x[,"sample"])`
 
+**Sharing a failing equation without its names:** `python scenario_compare.py mask --eq model.txt --failed` prints the equation lines that cannot be used with every series name replaced by `x` and every number by `9`. EViews functions (`@MOVAV` …) and keywords (`AR`, `UNCOND`, `DLOG` …) stay visible, and hidden or unusual characters are spelled out, e.g. `<U+200B zero width space>`. Without `--failed` it shows all lines with `[...]` or AR/MA terms. `--match REGEX` picks other lines.
+
 String, matrix and program functions are not included, because they can't appear in a model equation.
+
+## Other models (not Moody's), and scenarios with different equations
+
+Nothing in the tool is Moody's-specific. Any model whose equations are written as `Y = formula` (EViews style) works, with or without geographies; without geography codes, those tabs simply don't appear.
+
+**Different equations in A and B:** give each scenario its own equation file(s):
+
+```bash
+python scenario_compare.py report --a base.csv --b stress.csv \
+       --eq-a equations_base.txt --eq-b equations_stress.txt -o compare.html
+```
+
+The two sets are compared variable by variable. Spacing, upper/lower case and `[ar(1)=…]` options are ignored:
+
+| Status | Meaning | How its gap is split |
+|---|---|---|
+| changed | the formula differs | inputs + **equation changed**. Switching to B's equation, with its add-factor, is one effect. Every effect is averaged over A's and B's equation, so an input that only one formula uses still gets its share. |
+| only in A | B sets the variable directly | inputs (A's formula) + **equation dropped in B** |
+| only in B | A sets the variable directly | inputs (B's formula) + **equation added in B** |
+
+These switches behave like shocks everywhere: Where B starts, `attribute`, Importance and the Summary map. A new tab, **Equations A vs B**, lists every difference with the changed parts highlighted, and the detail panel shows both equations.
+
+**Potential exogenous:** any variable that no equation computes is labelled *potential exogenous* and treated as set directly by the scenario. Equations that cannot be evaluated are treated the same way, and listed in `<report>_not_evaluable.csv`.
+
+Demo: `python make_demo_generic.py demo_generic` builds a credit-union stress model (no geographies; PD and RWA re-specified, OPEX and DEPOSITS switch between equation and given path); `generic_report.html` is its report.
 
 ## Variables the team set exogenously
 
@@ -149,15 +191,17 @@ Without `--exog`, an exogenized variable shows up as *mostly add-factor*. The to
 
 | option | default | what |
 |---|---|---|
+| `--target SPEC` | | keep only these variables and everything that feeds them (directly or through any chain of equations, lags included). A geography code (`ICAN`), a wildcard (`"*_ICAN"`), names or a comma list; repeatable. Results for the kept variables are unchanged, just faster |
 | `--tol` | 1e-6 | relative tolerance before a series counts as different |
 | `--geo-sep` | auto | character before the geography code: `.`, `_`, or auto-detect. A name ending counts as a geography only if 3+ concepts share it |
 | `--exog LIST` | | variables set exogenously by the team (file or comma list) |
 | `--af-suffix` | `_A` | suffix of add-factor series (`GDP.US_A`; also matches `GDP_A.US`); comma-separate several |
 | `--adj-threshold` | 0.25 | add-factor share that tags a variable "mostly add-factor" |
-| `--embed` | 1500 | series with charts and per-period detail in the HTML; the rest are still ranked and traceable |
-| `--focus VAR` | | always include VAR in full detail |
+| `--embed` | auto | series with full charts in the HTML: a number, `all`, or auto (all if ≤5,000 changed, else top 1,500). Every other variable still gets its per-quarter shares |
+| `--focus VAR` | | always include VAR in full detail. A name, a comma list, or a wildcard like `"*_ICAN"` (all changed Canada series); repeatable |
 | `--key LIST` | auto | key variables for the Summary tab (file or comma list) |
 | `--summary-n` | 8 | how many key variables to pick automatically (0 turns the Summary off) |
+| `-o` (importance) | | also write the full report, opened on the Importance tab |
 | `--influence-n` | 20 | scenario shocks simulated for the Influence tab (each takes ~5 s on a 20,000-equation model) |
 
 ## Demo
