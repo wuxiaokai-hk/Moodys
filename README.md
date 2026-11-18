@@ -1,4 +1,4 @@
-# scenario_compare — compare two Moody's scenarios quickly
+# scenario_compare — compare two macro scenarios quickly
 
 One Python file, **standard library only** (no pip, no openpyxl/pandas). Python 3.8+.
 
@@ -166,11 +166,11 @@ These switches behave like shocks everywhere: Where B starts, `attribute`, Impor
 
 **Potential exogenous:** any variable that no equation computes is labelled *potential exogenous* and treated as set directly by the scenario. Equations that cannot be evaluated are treated the same way, and listed in `<report>_not_evaluable.csv`.
 
-Demo: `python make_demo_generic.py demo_generic` builds a credit-union stress model (no geographies; PD and RWA re-specified, OPEX and DEPOSITS switch between equation and given path); `generic_report.html` is its report.
+Demo: `python make_demo_generic.py demo_generic` builds a bank stress model (no geographies; PD and RWA re-specified, OPEX and DEPOSITS switch between equation and given path); `generic_report.html` is its report.
 
-## Variables the team set exogenously
+## Variables the modeller set exogenously
 
-If the team overrode a variable that has an equation (exogenized it), list it with `--exog`:
+If the modeller overrode a variable that has an equation (exogenized it), list it with `--exog`:
 
 ```bash
 python scenario_compare.py report --a base.csv --b s3.csv --eq model.txt --exog exog_list.txt
@@ -194,7 +194,7 @@ Without `--exog`, an exogenized variable shows up as *mostly add-factor*. The to
 | `--target SPEC` | | keep only these variables and everything that feeds them (directly or through any chain of equations, lags included). A geography code (`ICAN`), a wildcard (`"*_ICAN"`), names or a comma list; repeatable. Results for the kept variables are unchanged, just faster |
 | `--tol` | 1e-6 | relative tolerance before a series counts as different |
 | `--geo-sep` | auto | character before the geography code: `.`, `_`, or auto-detect. A name ending counts as a geography only if 3+ concepts share it |
-| `--exog LIST` | | variables set exogenously by the team (file or comma list) |
+| `--exog LIST` | | variables set exogenously by the modeller (file or comma list) |
 | `--af-suffix` | `_A` | suffix of add-factor series (`GDP.US_A`; also matches `GDP_A.US`); comma-separate several |
 | `--adj-threshold` | 0.25 | add-factor share that tags a variable "mostly add-factor" |
 | `--embed` | auto | series with full charts in the HTML: a number, `all`, or auto (all if ≤5,000 changed, else top 1,500). Every other variable still gets its per-quarter shares |
