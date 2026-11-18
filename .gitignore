@@ -12,3 +12,8 @@ venv/
 *.log
 .env
 .env.*
+demo_large/
+demo_large_report.html
+demo_large_report_not_evaluable.csv
+*_not_evaluable.csv
+__pycache__/
