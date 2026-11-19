@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-scenario_compare.py - make sense of two Moody's (EViews-style) macro scenarios.
+scenario_compare.py - make sense of two EViews-style macro scenarios (any vendor or in-house model).
 
 Standard library only (Python 3.8+). No pip installs, no openpyxl/pandas.
 

@@ -173,9 +173,9 @@ Functions the tool understands: all EViews functions that can appear in a series
 
 String, matrix and program functions are not included, because they can't appear in a model equation.
 
-## Other models (not Moody's), and scenarios with different equations
+## Other models, and scenarios with different equations
 
-Nothing in the tool is Moody's-specific. Any model whose equations are written as `Y = formula` (EViews style) works, with or without geographies; without geography codes, those tabs simply don't appear.
+Nothing in the tool is vendor-specific. It works with commercial EViews-style regional macro models (such as those sold by Moody's Analytics or Oxford Economics), supervisory or in-house models. Any model whose equations are written as `Y = formula` (EViews style) works, with or without geographies; without geography codes, those tabs simply don't appear.
 
 **Different equations in A and B:** give each scenario its own equation file(s):
 
@@ -244,7 +244,11 @@ Two demos with the same model and numbers, in the two naming styles:
 
 Build either with `python make_demo.py 50 800 demo` or `python make_demo.py 50 800 demo_underscore underscore`.
 
-`make_demo.py` builds a toy Moody's-like model (national block + 50 states, 1,162 series): a baseline CSV, an alternative XLSX (oil +30% fading, policy rate +100bp, add-factors `FC$.IUSA_A` and `FHPI.ICA_A`) and the equations. `demo_report.html` is the output. The tool recovers exactly the four planted shocks as *Where B starts*.
+`make_demo.py` builds a toy vendor-style regional model (national block + 50 states, 1,162 series): a baseline CSV, an alternative XLSX (oil +30% fading, policy rate +100bp, add-factors `FC$.IUSA_A` and `FHPI.ICA_A`) and the equations. `demo_report.html` is the output. The tool recovers exactly the four planted shocks as *Where B starts*.
 
 
-**Large test model.** `python make_demo_large.py demo_large` writes a made-up Moody's-style model: a US national block plus 51 states, about 20,000 series and 18,870 equations; scenario B raises oil 35% and Fed funds 0.5 from 2023Q1. A full `report` on it takes about 50 seconds, makes a 19 MB page, and the page opens in under a second.
+**Large test model.** `python make_demo_large.py demo_large` writes a made-up vendor-style regional model: a US national block plus 51 states, about 20,000 series and 18,870 equations; scenario B raises oil 35% and Fed funds 0.5 from 2023Q1. A full `report` on it takes about 50 seconds, makes a 19 MB page, and the page opens in under a second.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Free to use, change and share. Data downloaded from public sources stay under their providers' terms. Independent open-source project, not affiliated with or endorsed by any employer, regulator or data vendor.

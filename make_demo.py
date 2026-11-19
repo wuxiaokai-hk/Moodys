@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a small Moody's-like demo: equations + baseline (CSV) + alternative (XLSX).
+"""Build a small vendor-style demo: equations + baseline (CSV) + alternative (XLSX).
 
 The alternative scenario: oil price +30% shock fading out, policy rate +100bp,
 a judgmental cut to consumer spending (add-factor) in 2026, and a California
@@ -156,7 +156,7 @@ def simulate(shock):
 
 A = simulate(False)
 B = simulate(True)
-# add-factor series (Moody's style <name>_A): zero in the baseline, the judgmental adjustment in the alternative
+# add-factor series (vendor style <name>_A): zero in the baseline, the judgmental adjustment in the alternative
 for nm, rng, v in [('FC$.IUSA', range(F0, F0 + 4), -0.004), ('FHPI.ICA', range(F0 + 1, F0 + 3), -0.01)]:
     if nm in A:
         A[nm + '_A'] = [0.0] * T
@@ -202,7 +202,7 @@ def xlsx(path, rows):
         z.writestr('xl/worksheets/sheet1.xml', '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>%s</sheetData></worksheet>' % body)
 
 
-rows = [['Description:'] + [desc(n) for n in names], ['Mnemonic:'] + [NM(n) for n in names], ['Source:'] + ['Moody\'s demo'] * len(names)]
+rows = [['Description:'] + [desc(n) for n in names], ['Mnemonic:'] + [NM(n) for n in names], ["Source:"] + ["demo"] * len(names)]
 for t, p in enumerate(periods):
     rows.append([p] + [round(B[n][t], 6) for n in names])
 xlsx(os.path.join(OUT, 'alt_scenario.xlsx'), rows)

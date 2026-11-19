@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A small non-Moody's demo: a bank stress model with NO geographies, where scenario B
+"""A small demo without geographies: a bank stress model with NO geographies, where scenario B
 also uses DIFFERENT equations from scenario A.
 
   python make_demo_generic.py demo_generic
